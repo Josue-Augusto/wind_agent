@@ -87,6 +87,11 @@ async def _run_application() -> None:
     def _create_toggle_task() -> None:
         if shutting_down:
             return
+        if pending_tasks:
+            _LOGGER.info(
+                "Ignoring session toggle while the previous session action is still in progress."
+            )
+            return
         task = asyncio.create_task(
             execute_voice_session.execute(),
             name="toggle-voice-session",
@@ -107,7 +112,29 @@ async def _run_application() -> None:
         except RuntimeError as error:
             _LOGGER.warning("Could not schedule application shutdown: %s", error)
 
-    tray = SystemTrayController(_schedule_toggle_session, _request_shutdown)
+    def _select_audio_input_device(device_index: int) -> None:
+        try:
+            datasource.select_audio_input_device(device_index)
+            _LOGGER.info(
+                "Audio input device %d selected and saved for future sessions.",
+                device_index,
+            )
+        except (RuntimeError, ValueError) as error:
+            _LOGGER.error("Could not select audio input device %d: %s", device_index, error)
+
+    def _schedule_audio_input_device_selection(device_index: int) -> None:
+        try:
+            loop.call_soon_threadsafe(_select_audio_input_device, device_index)
+        except RuntimeError as error:
+            _LOGGER.warning("Could not schedule audio device selection: %s", error)
+
+    tray = SystemTrayController(
+        _schedule_toggle_session,
+        _request_shutdown,
+        datasource.get_audio_input_devices(),
+        datasource.get_selected_audio_input_device(),
+        _schedule_audio_input_device_selection,
+    )
     hotkey = HotkeyListener(_schedule_toggle_session)
     tray.set_agent_state(repository.get_state().value)
 

@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import os
+import time
 import tomllib
+from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import httpx
 import sounddevice as sd
 
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from src.domain.entities.agent_state import AgentState
 from pipecat.frames.frames import (
     Frame,
@@ -24,7 +30,10 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
     TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
+from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 if TYPE_CHECKING:
@@ -35,6 +44,9 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _CONFIG_FILE = Path(__file__).resolve().parents[3] / "config.toml"
+_AUDIO_SETTINGS_FILE = Path(
+    os.getenv("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+) / "WindAgent" / "settings.json"
 
 
 @dataclass(frozen=True)
@@ -45,6 +57,8 @@ class LocalPipecatSettings:
     whisper_device: str = "cuda"
     whisper_compute_type: str = "float16"
     piper_voice: str = "pt_BR-faber-medium"
+    audio_input_device: int | str | None = None
+    audio_input_gain: float = 4.0
     audio_sample_rate: int = 16_000
     audio_channels: int = 1
 
@@ -59,6 +73,8 @@ class LocalPipecatSettings:
             raise ValueError("audio_sample_rate must be greater than zero.")
         if self.audio_channels != 1:
             raise ValueError("The Whisper pipeline currently supports mono audio only.")
+        if not math.isfinite(self.audio_input_gain) or not 0 < self.audio_input_gain <= 32:
+            raise ValueError("audio_input_gain must be greater than zero and at most 32.")
         if not self.whisper_model.strip():
             raise ValueError("whisper_model cannot be empty.")
         if not self.piper_voice.strip():
@@ -89,6 +105,10 @@ class LocalPipecatSettings:
                 f"Set a non-empty 'model' in [lm_studio] in {_CONFIG_FILE}"
             )
 
+        input_device = os.getenv("AUDIO_INPUT_DEVICE")
+        if input_device is not None:
+            input_device = int(input_device) if input_device.isdecimal() else input_device
+
         return cls(
             lm_studio_base_url=os.getenv(
                 "LM_STUDIO_BASE_URL", "http://localhost:1234/v1"
@@ -98,26 +118,52 @@ class LocalPipecatSettings:
             whisper_device=os.getenv("WHISPER_DEVICE", "cuda"),
             whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "float16"),
             piper_voice=os.getenv("PIPER_VOICE", "pt_BR-faber-medium"),
+            audio_input_device=input_device,
+            audio_input_gain=float(os.getenv("AUDIO_INPUT_GAIN", "4.0")),
         )
 
 
 class _SoundDeviceInputProcessor(FrameProcessor):
-    def __init__(self, sample_rate: int, channels: int) -> None:
+    def __init__(
+        self,
+        sample_rate: int,
+        channels: int,
+        device: int | str | None = None,
+        capture_channels: int = 1,
+        gain: float = 1.0,
+    ) -> None:
         super().__init__()
         self._sample_rate = sample_rate
         self._channels = channels
+        self._device = device
+        self._capture_channels = capture_channels
+        self._gain = gain
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream: sd.InputStream | None = None
         self._active = False
+        self._first_audio_frame_logged = False
+        self._last_audio_level_logged_at = time.monotonic()
+        self._audio_level_sample_count = 0
+        self._audio_level_squared_sum = 0.0
+        self._audio_level_peak = 0
 
     def start_capture(self) -> None:
         if self._stream is not None:
             raise RuntimeError("Microphone capture has already been started.")
 
         self._loop = asyncio.get_running_loop()
+        selected_device = sd.query_devices(self._device, "input")
+        host_api = sd.query_hostapis()[selected_device["hostapi"]]["name"]
+        _LOGGER.info(
+            "Selected audio input device: %s (%s), software gain up to %.1fx",
+            selected_device["name"],
+            host_api,
+            self._gain,
+        )
         stream = sd.InputStream(
+            device=self._device,
             samplerate=self._sample_rate,
-            channels=self._channels,
+            channels=self._capture_channels,
             dtype="int16",
             blocksize=max(1, self._sample_rate // 50),
             callback=self._on_audio,
@@ -128,6 +174,9 @@ class _SoundDeviceInputProcessor(FrameProcessor):
             stream.close()
             raise
         self._stream = stream
+        _LOGGER.info(
+            "Microphone capture started on input device '%s'.", selected_device["name"]
+        )
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -142,6 +191,52 @@ class _SoundDeviceInputProcessor(FrameProcessor):
         loop = self._loop
         if not self._active or loop is None or loop.is_closed():
             return
+
+        if not self._first_audio_frame_logged:
+            self._first_audio_frame_logged = True
+            _LOGGER.info("Microphone audio frames are reaching the Pipecat pipeline.")
+
+        if audio.ndim > 1:
+            channel_rms = (audio.astype("float64") ** 2).mean(axis=0)
+            audio = audio[:, int(channel_rms.argmax())]
+        if self._gain != 1.0:
+            audio = (
+                (audio.astype("float32") * self._gain)
+                .clip(-32768, 32767)
+                .astype("int16")
+            )
+
+        audio_float = audio.astype("float32")
+        self._audio_level_sample_count += audio.size
+        self._audio_level_squared_sum += float((audio_float**2).sum())
+        self._audio_level_peak = max(
+            self._audio_level_peak,
+            int(abs(audio.astype("int32")).max()) if audio.size else 0,
+        )
+        now = time.monotonic()
+        if now - self._last_audio_level_logged_at >= 3.0:
+            self._last_audio_level_logged_at = now
+            peak = self._audio_level_peak
+            rms = (
+                (self._audio_level_squared_sum / self._audio_level_sample_count) ** 0.5
+                / 32768.0
+                if self._audio_level_sample_count
+                else 0.0
+            )
+            self._audio_level_sample_count = 0
+            self._audio_level_squared_sum = 0.0
+            self._audio_level_peak = 0
+            if peak <= 1 or rms < 0.001:
+                _LOGGER.warning(
+                    "Microphone input is silent or very quiet: peak=%d/32768, rms=%.4f. "
+                    "Check Windows microphone permissions or set AUDIO_INPUT_DEVICE.",
+                    peak,
+                    rms,
+                )
+            else:
+                _LOGGER.info(
+                    "Microphone input level: peak=%d/32768, rms=%.4f.", peak, rms
+                )
 
         frame = InputAudioRawFrame(
             audio=audio.tobytes(),
@@ -233,13 +328,62 @@ class _AgentStateProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if direction is FrameDirection.DOWNSTREAM:
-            if isinstance(frame, (TranscriptionFrame, LLMFullResponseStartFrame)):
+            if isinstance(frame, VADUserStartedSpeakingFrame):
+                _LOGGER.info("VAD detected speech; waiting for the end of the utterance.")
+            elif isinstance(frame, VADUserStoppedSpeakingFrame):
+                _LOGGER.info("VAD detected the end of the utterance; Whisper will transcribe it.")
+            elif isinstance(frame, LLMFullResponseStartFrame):
+                _LOGGER.info("LM Studio started generating a response.")
                 self._on_state_change(AgentState.PROCESSING)
             elif isinstance(frame, TTSStartedFrame):
                 self._on_state_change(AgentState.SPEAKING)
             elif isinstance(frame, (TTSStoppedFrame, LLMFullResponseEndFrame)):
                 self._on_state_change(AgentState.LISTENING)
         await self.push_frame(frame, direction)
+
+
+class _TranscriptionLoggingProcessor(FrameProcessor):
+    def __init__(self, on_state_change: Callable[[AgentState], None]) -> None:
+        super().__init__()
+        self._on_state_change = on_state_change
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if direction is FrameDirection.DOWNSTREAM and isinstance(
+            frame, TranscriptionFrame
+        ):
+            _LOGGER.info(
+                "Whisper produced a transcription (%d characters); forwarding it to the conversation.",
+                len(frame.text.strip()),
+            )
+            self._on_state_change(AgentState.PROCESSING)
+        await self.push_frame(frame, direction)
+
+
+class _DiagnosticSileroVADAnalyzer(SileroVADAnalyzer):
+    def __init__(self, *, sample_rate: int, params: VADParams) -> None:
+        super().__init__(sample_rate=sample_rate, params=params)
+        self._last_confidence = 0.0
+        self._last_diagnostic_at = time.monotonic()
+
+    def voice_confidence(self, buffer: bytes) -> float:
+        self._last_confidence = super().voice_confidence(buffer)
+        return self._last_confidence
+
+    def _get_smoothed_volume(self, audio: bytes) -> float:
+        volume = super()._get_smoothed_volume(audio)
+        now = time.monotonic()
+        if now - self._last_diagnostic_at >= 1.0:
+            self._last_diagnostic_at = now
+            _LOGGER.info(
+                "VAD diagnostic: confidence=%.3f (threshold=%.3f), "
+                "volume=%.3f (threshold=%.3f).",
+                self._last_confidence,
+                self.params.confidence,
+                volume,
+                self.params.min_volume,
+            )
+        return volume
 
 
 class LocalPipecatDataSource:
@@ -249,12 +393,203 @@ class LocalPipecatDataSource:
         on_state_change: Callable[[AgentState], None] | None = None,
     ) -> None:
         self._settings = settings or LocalPipecatSettings.from_environment()
+        self._audio_devices = self._discover_audio_input_devices()
+        self._audio_input_device = self._resolve_initial_audio_input_device()
         self._on_state_change = on_state_change
         self._session_lock = asyncio.Lock()
         self._runner_task: asyncio.Task[None] | None = None
         self._runner: WorkerRunner | None = None
         self._pipeline_worker: PipelineWorker | None = None
         self._input_processor: _SoundDeviceInputProcessor | None = None
+
+    def _discover_audio_input_devices(self) -> list[dict[str, object]]:
+        host_apis = sd.query_hostapis()
+        devices = sd.query_devices()
+        candidates = [
+            (index, device, host_apis[device["hostapi"]]["name"])
+            for index, device in enumerate(devices)
+            if device["max_input_channels"] >= self._settings.audio_channels
+            and str(device["name"]).strip()
+            and not any(
+                marker in str(device["name"]).casefold()
+                for marker in (
+                    "mapper",
+                    "mapeador",
+                    "driver de captura de som primário",
+                    "primary sound driver",
+                )
+            )
+        ]
+        unique_devices: list[dict[str, object]] = []
+        grouped_devices: dict[str, list[tuple[int, Any, str]]] = {}
+        for candidate in candidates:
+            normalized_name = str(candidate[1]["name"]).strip().casefold()
+            grouped_devices.setdefault(normalized_name, []).append(candidate)
+
+        api_priority = {
+            "MME": 0,
+            "Windows DirectSound": 1,
+            "Windows WASAPI": 2,
+            "Windows WDM-KS": 3,
+        }
+        for name_candidates in grouped_devices.values():
+            compatible_candidates = []
+            for candidate in name_candidates:
+                index, device, host_api_name = candidate
+                try:
+                    sd.check_input_settings(
+                        device=index,
+                        channels=self._settings.audio_channels,
+                        dtype="int16",
+                        samplerate=self._settings.audio_sample_rate,
+                    )
+                except sd.PortAudioError:
+                    continue
+                capture_channels = 1
+                if device["max_input_channels"] >= 2:
+                    try:
+                        sd.check_input_settings(
+                            device=index,
+                            channels=2,
+                            dtype="int16",
+                            samplerate=self._settings.audio_sample_rate,
+                        )
+                        capture_channels = 2
+                    except sd.PortAudioError:
+                        pass
+                compatible_candidates.append(
+                    (*candidate, capture_channels)
+                )
+            if not compatible_candidates:
+                continue
+            index, device, host_api_name, capture_channels = min(
+                compatible_candidates,
+                key=lambda candidate: api_priority.get(candidate[2], 99),
+            )
+            unique_devices.append(
+                {
+                    "index": index,
+                    "name": str(device["name"]).strip(),
+                    "host_api": host_api_name,
+                    "capture_channels": capture_channels,
+                }
+            )
+        return unique_devices
+
+    def get_audio_input_devices(self) -> list[tuple[int, str]]:
+        return [
+            (int(device["index"]), str(device["name"]))
+            for device in self._audio_devices
+        ]
+
+    def _resolve_initial_audio_input_device(self) -> int:
+        requested = self._settings.audio_input_device
+        if requested is not None:
+            try:
+                raw_device = sd.query_devices(requested, "input")
+                match = self._find_audio_device(str(raw_device["name"]))
+                if match is not None:
+                    return match
+            except (ValueError, sd.PortAudioError):
+                _LOGGER.warning(
+                    "Configured audio input device %r is unavailable.", requested
+                )
+
+        saved_device = self._load_saved_audio_device()
+        if saved_device is not None:
+            match = next(
+                (
+                    int(device["index"])
+                    for device in self._audio_devices
+                    if device["name"] == saved_device.get("name")
+                ),
+                None,
+            )
+            if match is not None:
+                _LOGGER.info(
+                    "Restored saved audio input device: %s", saved_device["name"]
+                )
+                return match
+
+        try:
+            default_device = sd.query_devices(kind="input")
+            match = self._find_audio_device(str(default_device["name"]))
+            if match is not None:
+                _LOGGER.info(
+                    "Using the Windows default audio input: %s",
+                    default_device["name"],
+                )
+                return match
+        except (ValueError, sd.PortAudioError):
+            pass
+
+        if not self._audio_devices:
+            raise RuntimeError("No active audio input devices were found.")
+        fallback = int(self._audio_devices[0]["index"])
+        _LOGGER.warning(
+            "Windows default input was unavailable; using %s.",
+            self._audio_devices[0]["name"],
+        )
+        return fallback
+
+    def _find_audio_device(self, name: str) -> int | None:
+        for device in self._audio_devices:
+            if str(device["name"]).casefold() == name.casefold():
+                return int(device["index"])
+        return None
+
+    @staticmethod
+    def _load_saved_audio_device() -> dict[str, str] | None:
+        try:
+            settings = json.loads(_AUDIO_SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        audio_device = (
+            settings.get("audio_input_device") if isinstance(settings, dict) else None
+        )
+        if (
+            isinstance(audio_device, dict)
+            and isinstance(audio_device.get("name"), str)
+            and isinstance(audio_device.get("host_api"), str)
+        ):
+            return audio_device
+        return None
+
+    def get_selected_audio_input_device(self) -> int:
+        return self._audio_input_device
+
+    def get_audio_input_capture_channels(self) -> int:
+        device = next(
+            item
+            for item in self._audio_devices
+            if item["index"] == self._audio_input_device
+        )
+        return int(device["capture_channels"])
+
+    def select_audio_input_device(self, device_index: int) -> None:
+        selected_device = next(
+            (device for device in self._audio_devices if device["index"] == device_index),
+            None,
+        )
+        if selected_device is None:
+            raise ValueError(f"Audio input device {device_index} is unavailable.")
+        self._audio_input_device = device_index
+        settings = {
+            "audio_input_device": {
+                "name": selected_device["name"],
+                "host_api": selected_device["host_api"],
+            }
+        }
+        try:
+            _AUDIO_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            temporary_file = _AUDIO_SETTINGS_FILE.with_suffix(".tmp")
+            temporary_file.write_text(
+                json.dumps(settings, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary_file.replace(_AUDIO_SETTINGS_FILE)
+        except OSError:
+            _LOGGER.exception("Could not save the selected audio input device.")
 
     def set_state_listener(
         self, listener: Callable[[AgentState], None] | None
@@ -312,15 +647,28 @@ class LocalPipecatDataSource:
             )
             context_aggregator = LLMContextAggregatorPair(context)
             input_processor = _SoundDeviceInputProcessor(
-                self._settings.audio_sample_rate, self._settings.audio_channels
+                self._settings.audio_sample_rate,
+                self._settings.audio_channels,
+                self._audio_input_device,
+                self.get_audio_input_capture_channels(),
+                self._settings.audio_input_gain,
+            )
+            vad_processor = VADProcessor(
+                vad_analyzer=_DiagnosticSileroVADAnalyzer(
+                    sample_rate=self._settings.audio_sample_rate,
+                    params=VADParams(min_volume=0.2, stop_secs=0.8),
+                )
             )
             output_processor = _SoundDeviceOutputProcessor()
+            transcription_processor = _TranscriptionLoggingProcessor(self._notify_state)
             state_processor = _AgentStateProcessor(self._notify_state)
             try:
                 pipeline = Pipeline(
                     [
                         input_processor,
+                        vad_processor,
                         stt,
+                        transcription_processor,
                         context_aggregator.user(),
                         llm,
                         tts,
@@ -348,7 +696,13 @@ class LocalPipecatDataSource:
                     try:
                         await output_processor.cleanup()
                     finally:
-                        await state_processor.cleanup()
+                        try:
+                            await transcription_processor.cleanup()
+                        finally:
+                            try:
+                                await state_processor.cleanup()
+                            finally:
+                                await vad_processor.cleanup()
                 raise
 
             self._input_processor = input_processor
@@ -369,8 +723,10 @@ class LocalPipecatDataSource:
                 return
 
             try:
-                if not runner_task.done() and self._runner is not None:
-                    await self._runner.cancel()
+                await self._cleanup_input_processor()
+                pipeline_worker = self._pipeline_worker
+                if not runner_task.done() and pipeline_worker is not None:
+                    await pipeline_worker.end(reason="Voice session stopped by user")
                 await runner_task
             finally:
                 try:

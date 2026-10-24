@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from threading import RLock
+from typing import Sequence
 
 import pystray
 from PIL import Image, ImageDraw
@@ -10,9 +11,18 @@ class SystemTrayController:
         self,
         on_toggle_session: Callable[[], None],
         on_exit: Callable[[], None],
+        audio_input_devices: Sequence[tuple[int, str]],
+        selected_audio_input_device: int,
+        on_select_audio_input_device: Callable[[int], None],
     ) -> None:
+        self._audio_input_devices = tuple(audio_input_devices)
+        self._selected_audio_input_device = selected_audio_input_device
+        self._on_select_audio_input_device = on_select_audio_input_device
         menu = pystray.Menu(
             pystray.MenuItem("Iniciar/parar sessão", self._handle_toggle),
+            pystray.MenuItem(
+                "Microfone (próxima sessão)", self._create_audio_input_menu()
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Sair", self._handle_exit),
         )
@@ -61,6 +71,30 @@ class SystemTrayController:
 
     def _handle_toggle(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         self._on_toggle_session()
+
+    def _create_audio_input_menu(self) -> pystray.Menu:
+        def make_action(device_index: int) -> Callable:
+            def select_device(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+                self._selected_audio_input_device = device_index
+                self._on_select_audio_input_device(device_index)
+                icon.update_menu()
+
+            return select_device
+
+        items = [
+            pystray.MenuItem(
+                label,
+                make_action(device_index),
+                checked=lambda item, index=device_index: (
+                    index == self._selected_audio_input_device
+                ),
+                radio=True,
+            )
+            for device_index, label in self._audio_input_devices
+        ]
+        if not items:
+            items.append(pystray.MenuItem("Nenhum microfone disponível", None, enabled=False))
+        return pystray.Menu(*items)
 
     def _handle_exit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         try:

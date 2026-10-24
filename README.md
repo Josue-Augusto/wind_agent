@@ -49,6 +49,8 @@ Outras configurações opcionais podem ser definidas por variáveis de ambiente:
 | `WHISPER_DEVICE` | `cuda` | Dispositivo Whisper; use `cpu` sem GPU compatível |
 | `WHISPER_COMPUTE_TYPE` | `float16` | Tipo de cálculo; use `int8` em CPU |
 | `PIPER_VOICE` | `pt_BR-faber-medium` | Voz Piper |
+| `AUDIO_INPUT_DEVICE` | Entrada padrão do Windows | Substituição opcional por índice ou nome do dispositivo |
+| `AUDIO_INPUT_GAIN` | `4.0` | Ganho fixo do microfone com proteção contra clipping; ajuste se necessário |
 
 O código valida que a URL do LM Studio aponta para `localhost`, `127.0.0.1` ou
 `::1`. Isso impede o envio das conversas para um endpoint remoto. Os modelos de
@@ -76,6 +78,17 @@ para iniciar `pythonw.exe` com o argumento `-m bin.main` e defina a pasta do
 projeto como **Iniciar em**.
 
 Os logs da aplicação ficam em `%LOCALAPPDATA%\WindAgent\logs`.
+Para escolher a entrada, abra o menu do ícone do WindAgent na bandeja do Windows,
+entre em **Microfone (próxima sessão)** e selecione o dispositivo. A opção marcada
+é usada ao iniciar a próxima sessão e fica salva em
+`%LOCALAPPDATA%\WindAgent\settings.json`. O menu mostra uma única entrada por
+microfone que aceita a taxa de captura do Whisper, sem listar mapeadores do
+Windows nem repetir cada entrada por driver. Sem escolha salva, usa a entrada
+padrão do sistema.
+Ao iniciar uma sessão, o log `application.log` informa quando o microfone
+entrega áudio, quando o Whisper conclui uma transcrição e quando o LM Studio
+começa a responder. Se não aparecer a mensagem de áudio do microfone, selecione
+o microfone correto como entrada padrão nas configurações de som do Windows.
 
 > **Distribuição:** a integração Piper em processo usa `piper-tts`, licenciado
 > sob GPL-3.0. Avalie as obrigações da licença antes de redistribuir o
