@@ -13,7 +13,6 @@ from collections.abc import AsyncGenerator, Callable, Iterable, Iterator
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event
 from typing import Any, TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -226,7 +225,6 @@ class _SoundDeviceInputProcessor(FrameProcessor):
         self._device = device
         self._capture_channels = capture_channels
         self._gain = gain
-        self._bot_speaking = Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream: sd.InputStream | None = None
         self._active = False
@@ -273,12 +271,6 @@ class _SoundDeviceInputProcessor(FrameProcessor):
         if isinstance(frame, StartFrame):
             self._active = True
 
-    def set_bot_speaking(self, speaking: bool) -> None:
-        if speaking:
-            self._bot_speaking.set()
-        else:
-            self._bot_speaking.clear()
-
     def _on_audio(self, audio, frame_count, time_info, status) -> None:
         if status:
             _LOGGER.warning("Microphone audio callback reported: %s", status)
@@ -286,7 +278,6 @@ class _SoundDeviceInputProcessor(FrameProcessor):
         loop = self._loop
         if (
             not self._active
-            or self._bot_speaking.is_set()
             or loop is None
             or loop.is_closed()
         ):
@@ -361,7 +352,6 @@ class _SoundDeviceInputProcessor(FrameProcessor):
 
     async def cleanup(self) -> None:
         self._active = False
-        self._bot_speaking.clear()
         stream, self._stream = self._stream, None
         try:
             if stream is not None:
@@ -422,14 +412,9 @@ class _SoundDeviceOutputProcessor(FrameProcessor):
 
 
 class _AgentStateProcessor(FrameProcessor):
-    def __init__(
-        self,
-        on_state_change: Callable[[AgentState], None],
-        on_bot_speaking_change: Callable[[bool], None],
-    ) -> None:
+    def __init__(self, on_state_change: Callable[[AgentState], None]) -> None:
         super().__init__()
         self._on_state_change = on_state_change
-        self._on_bot_speaking_change = on_bot_speaking_change
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -442,10 +427,8 @@ class _AgentStateProcessor(FrameProcessor):
                 _LOGGER.info("LM Studio started generating a response.")
                 self._on_state_change(AgentState.PROCESSING)
             elif isinstance(frame, TTSStartedFrame):
-                self._on_bot_speaking_change(True)
                 self._on_state_change(AgentState.SPEAKING)
             elif isinstance(frame, TTSStoppedFrame):
-                self._on_bot_speaking_change(False)
                 self._on_state_change(AgentState.LISTENING)
             elif isinstance(frame, LLMFullResponseEndFrame):
                 self._on_state_change(AgentState.LISTENING)
@@ -1080,8 +1063,10 @@ class LocalPipecatDataSource:
                 user_params=LLMUserAggregatorParams(
                     user_turn_strategies=UserTurnStrategies(
                         start=[
-                            VADUserTurnStartStrategy(enable_interruptions=False),
-                            TranscriptionUserTurnStartStrategy(),
+                            VADUserTurnStartStrategy(enable_interruptions=True),
+                            TranscriptionUserTurnStartStrategy(
+                                enable_interruptions=True
+                            ),
                         ]
                     ),
                     empty_user_turn=None,
@@ -1102,10 +1087,7 @@ class LocalPipecatDataSource:
             )
             output_processor = _SoundDeviceOutputProcessor()
             transcription_processor = _TranscriptionLoggingProcessor(self._notify_state)
-            state_processor = _AgentStateProcessor(
-                self._notify_state,
-                input_processor.set_bot_speaking,
-            )
+            state_processor = _AgentStateProcessor(self._notify_state)
             try:
                 pipeline = Pipeline(
                     [
