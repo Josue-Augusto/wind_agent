@@ -1,6 +1,7 @@
 [lm_studio]
-model = "prism-ml/bonsai-27b"
+model = "openai/gpt-oss-20b"
 
 [conversation]
-language = "en"
-piper_voices = { pt = "pt_BR-faber-medium", en = "en_US-amy-medium", es = "es_ES-davefx-medium" }
+language = "pt"
+piper_voices = { pt = "pt_BR-cadu-medium", en = "en_US-amy-medium", es = "es_ES-davefx-medium" }
+voice = { speed = "normal", style = "natural", volume = "high" }

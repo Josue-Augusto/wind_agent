@@ -110,6 +110,11 @@ Idioma e vozes selecionadas ficam salvos na seção `[conversation]` de
 na próxima sessão; os modelos de voz podem ser baixados pelo Piper na primeira
 utilização.
 
+Em **Configuração da voz (próxima sessão)**, escolha velocidade lenta, normal
+ou rápida; estilo estável, natural ou expressivo; e volume suave, médio ou alto.
+O estilo ajusta a variação da síntese Piper, não controla diretamente o pitch.
+As três preferências também ficam em `[conversation].voice` no `config.toml`.
+
 > **Distribuição:** a integração Piper em processo usa `piper-tts`, licenciado
 > sob GPL-3.0. Avalie as obrigações da licença antes de redistribuir o
 > aplicativo.

@@ -21,6 +21,15 @@ class SystemTrayController:
         selected_voices_by_language: dict[str, str],
         on_select_conversation_language: Callable[[str], None],
         on_select_voice: Callable[[str], None],
+        voice_speed_options: Sequence[tuple[str, str]],
+        selected_voice_speed: str,
+        on_select_voice_speed: Callable[[str], None],
+        voice_style_options: Sequence[tuple[str, str]],
+        selected_voice_style: str,
+        on_select_voice_style: Callable[[str], None],
+        voice_volume_options: Sequence[tuple[str, str]],
+        selected_voice_volume: str,
+        on_select_voice_volume: Callable[[str], None],
     ) -> None:
         self._audio_input_devices = tuple(audio_input_devices)
         self._selected_audio_input_device = selected_audio_input_device
@@ -35,6 +44,15 @@ class SystemTrayController:
         self._selected_voices_by_language = dict(selected_voices_by_language)
         self._on_select_conversation_language = on_select_conversation_language
         self._on_select_voice = on_select_voice
+        self._voice_speed_options = tuple(voice_speed_options)
+        self._selected_voice_speed = selected_voice_speed
+        self._on_select_voice_speed = on_select_voice_speed
+        self._voice_style_options = tuple(voice_style_options)
+        self._selected_voice_style = selected_voice_style
+        self._on_select_voice_style = on_select_voice_style
+        self._voice_volume_options = tuple(voice_volume_options)
+        self._selected_voice_volume = selected_voice_volume
+        self._on_select_voice_volume = on_select_voice_volume
         self._icon = pystray.Icon(
             "wind_agent",
             self._create_icon_image(),
@@ -59,6 +77,20 @@ class SystemTrayController:
             pystray.MenuItem(
                 "Voz (próxima sessão)",
                 self._create_voice_menu(),
+            ),
+            pystray.MenuItem(
+                "Configuração da voz (próxima sessão)",
+                pystray.Menu(
+                    pystray.MenuItem(
+                        "Velocidade", self._create_voice_speed_menu()
+                    ),
+                    pystray.MenuItem(
+                        "Estilo", self._create_voice_style_menu()
+                    ),
+                    pystray.MenuItem(
+                        "Volume", self._create_voice_volume_menu()
+                    ),
+                ),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Sair", self._handle_exit),
@@ -183,6 +215,55 @@ class SystemTrayController:
                     radio=True,
                 )
                 for voice, label in voices
+            )
+        )
+
+    def _create_voice_speed_menu(self) -> pystray.Menu:
+        return self._create_voice_option_menu(
+            self._voice_speed_options,
+            "_selected_voice_speed",
+            self._on_select_voice_speed,
+        )
+
+    def _create_voice_style_menu(self) -> pystray.Menu:
+        return self._create_voice_option_menu(
+            self._voice_style_options,
+            "_selected_voice_style",
+            self._on_select_voice_style,
+        )
+
+    def _create_voice_volume_menu(self) -> pystray.Menu:
+        return self._create_voice_option_menu(
+            self._voice_volume_options,
+            "_selected_voice_volume",
+            self._on_select_voice_volume,
+        )
+
+    def _create_voice_option_menu(
+        self,
+        options: Sequence[tuple[str, str]],
+        selected_attribute: str,
+        on_select: Callable[[str], None],
+    ) -> pystray.Menu:
+        def make_action(value: str) -> Callable:
+            def select_option(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+                setattr(self, selected_attribute, value)
+                on_select(value)
+                icon.update_menu()
+
+            return select_option
+
+        return pystray.Menu(
+            *(
+                pystray.MenuItem(
+                    label,
+                    make_action(value),
+                    checked=lambda item, option=value: (
+                        option == getattr(self, selected_attribute)
+                    ),
+                    radio=True,
+                )
+                for value, label in options
             )
         )
 

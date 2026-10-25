@@ -9,7 +9,7 @@ import os
 import sys
 import time
 import tomllib
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Iterable, Iterator
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,6 +75,21 @@ _PIPER_VOICES = {
         ("es_ES-davefx-medium", "Davefx (média)"),
         ("es_MX-ald-medium", "Ald (média, México)"),
     ),
+}
+_VOICE_SPEEDS = {
+    "slow": ("Lenta", 1.2),
+    "normal": ("Normal", 1.0),
+    "fast": ("Rápida", 0.85),
+}
+_VOICE_STYLES = {
+    "steady": ("Estável", 0.45, 0.6),
+    "natural": ("Natural", 0.667, 0.8),
+    "expressive": ("Expressiva", 0.8, 1.0),
+}
+_VOICE_VOLUMES = {
+    "soft": ("Suave", 0.65),
+    "medium": ("Médio", 0.85),
+    "high": ("Alto", 1.0),
 }
 _WHISPER_LANGUAGES = {"pt": "PT", "en": "EN", "es": "ES"}
 _SYSTEM_PROMPTS = {
@@ -536,6 +551,24 @@ class LocalPipecatDataSource:
                     else _CONVERSATION_LANGUAGES[language][1]
                 )
             self._selected_voices_by_language[language] = selected
+        saved_voice = conversation_settings.get("voice", {})
+        if not isinstance(saved_voice, dict):
+            saved_voice = {}
+        self._voice_speed = (
+            saved_voice.get("speed")
+            if saved_voice.get("speed") in _VOICE_SPEEDS
+            else "normal"
+        )
+        self._voice_style = (
+            saved_voice.get("style")
+            if saved_voice.get("style") in _VOICE_STYLES
+            else "natural"
+        )
+        self._voice_volume = (
+            saved_voice.get("volume")
+            if saved_voice.get("volume") in _VOICE_VOLUMES
+            else "high"
+        )
         self._on_state_change = on_state_change
         self._session_lock = asyncio.Lock()
         self._runner_task: asyncio.Task[None] | None = None
@@ -761,12 +794,21 @@ class LocalPipecatDataSource:
             selected_voices = existing.get("piper_voices", {})
             if not isinstance(selected_voices, dict):
                 selected_voices = {}
+            voice_settings = existing.get("voice", {})
+            if not isinstance(voice_settings, dict):
+                voice_settings = {}
             serialized = {
                 "language": json.dumps(existing["language"], ensure_ascii=False),
                 "piper_voices": "{ "
                 + ", ".join(
                     f"{language} = {json.dumps(voice, ensure_ascii=False)}"
                     for language, voice in selected_voices.items()
+                )
+                + " }",
+                "voice": "{ "
+                + ", ".join(
+                    f"{key} = {json.dumps(value, ensure_ascii=False)}"
+                    for key, value in voice_settings.items()
                 )
                 + " }",
             }
@@ -840,6 +882,59 @@ class LocalPipecatDataSource:
     def get_selected_voices_by_language(self) -> dict[str, str]:
         return dict(self._selected_voices_by_language)
 
+    def get_voice_speed_options(self) -> list[tuple[str, str]]:
+        return [(key, value[0]) for key, value in _VOICE_SPEEDS.items()]
+
+    def get_voice_style_options(self) -> list[tuple[str, str]]:
+        return [(key, value[0]) for key, value in _VOICE_STYLES.items()]
+
+    def get_voice_volume_options(self) -> list[tuple[str, str]]:
+        return [(key, value[0]) for key, value in _VOICE_VOLUMES.items()]
+
+    def get_voice_adjustments(self) -> dict[str, str]:
+        return {
+            "speed": self._voice_speed,
+            "style": self._voice_style,
+            "volume": self._voice_volume,
+        }
+
+    def _save_voice_adjustments(self) -> None:
+        conversation = self._load_conversation_settings()
+        self._save_conversation_settings(
+            {
+                "language": self._conversation_language,
+                "piper_voices": self._selected_voices_by_language,
+                "voice": {
+                    **(
+                        conversation.get("voice", {})
+                        if isinstance(conversation.get("voice"), dict)
+                        else {}
+                    ),
+                    "speed": self._voice_speed,
+                    "style": self._voice_style,
+                    "volume": self._voice_volume,
+                },
+            }
+        )
+
+    def select_voice_speed(self, speed: str) -> None:
+        if speed not in _VOICE_SPEEDS:
+            raise ValueError(f"Unsupported voice speed: {speed}")
+        self._voice_speed = speed
+        self._save_voice_adjustments()
+
+    def select_voice_style(self, style: str) -> None:
+        if style not in _VOICE_STYLES:
+            raise ValueError(f"Unsupported voice style: {style}")
+        self._voice_style = style
+        self._save_voice_adjustments()
+
+    def select_voice_volume(self, volume: str) -> None:
+        if volume not in _VOICE_VOLUMES:
+            raise ValueError(f"Unsupported voice volume: {volume}")
+        self._voice_volume = volume
+        self._save_voice_adjustments()
+
     def select_conversation_language(self, language: str) -> None:
         if language not in _CONVERSATION_LANGUAGES:
             raise ValueError(f"Unsupported conversation language: {language}")
@@ -892,7 +987,52 @@ class LocalPipecatDataSource:
             from pipecat.services.piper.tts import PiperTTSService
             from pipecat.services.whisper.stt import WhisperSTTService
             from pipecat.transcriptions.language import Language
+            from pipecat.utils.tracing.service_decorators import traced_tts
             from pipecat.workers.runner import WorkerRunner
+            from piper.config import SynthesisConfig
+
+            class _ConfigurablePiperTTSService(PiperTTSService):
+                def __init__(self, *, synthesis_config: SynthesisConfig, **kwargs):
+                    self._synthesis_config = synthesis_config
+                    super().__init__(**kwargs)
+
+                @traced_tts
+                async def run_tts(
+                    self, text: str, context_id: str
+                ) -> AsyncGenerator[Frame, None]:
+                    def next_chunk(iterator: Iterator[Any]) -> Any | None:
+                        try:
+                            return next(iterator)
+                        except StopIteration:
+                            return None
+
+                    async def audio_chunks(iterator: Iterable[Any]):
+                        while True:
+                            chunk = await asyncio.to_thread(next_chunk, iterator)
+                            if chunk is None:
+                                return
+                            yield chunk.audio_int16_bytes
+
+                    try:
+                        await self.start_tts_usage_metrics(text)
+                        async for frame in self._stream_audio_frames_from_iterator(
+                            audio_chunks(
+                                self._voice.synthesize(
+                                    text, self._synthesis_config
+                                )
+                            ),
+                            in_sample_rate=self._voice.config.sample_rate,
+                            context_id=context_id,
+                        ):
+                            await self.stop_ttfb_metrics()
+                            yield frame
+                    except Exception as error:
+                        _LOGGER.exception("Piper speech synthesis failed.")
+                        yield ErrorFrame(
+                            error=f"Piper speech synthesis failed: {error}"
+                        )
+                    finally:
+                        await self.stop_ttfb_metrics()
 
             model = await self._resolve_lm_studio_model()
             llm = OpenAILLMService(
@@ -911,8 +1051,14 @@ class LocalPipecatDataSource:
                 sample_rate=self._settings.audio_sample_rate,
                 num_channels=self._settings.audio_channels,
             )
-            tts = PiperTTSService(
-                settings=PiperTTSService.Settings(voice=self.get_selected_voice())
+            tts = _ConfigurablePiperTTSService(
+                settings=PiperTTSService.Settings(voice=self.get_selected_voice()),
+                synthesis_config=SynthesisConfig(
+                    length_scale=_VOICE_SPEEDS[self._voice_speed][1],
+                    noise_scale=_VOICE_STYLES[self._voice_style][1],
+                    noise_w_scale=_VOICE_STYLES[self._voice_style][2],
+                    volume=_VOICE_VOLUMES[self._voice_volume][1],
+                ),
             )
 
             context = LLMContext(
