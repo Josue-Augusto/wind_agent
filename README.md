@@ -20,7 +20,12 @@ e instale as dependências:
 ```powershell
 if (-not (Test-Path ".venv\Scripts\python.exe")) { uv venv --python 3.13 }
 uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+uv pip install --python .venv\Scripts\python.exe -r requirements-cuda.txt
 ```
+
+`requirements-cuda.txt` instala as bibliotecas CUDA 12 e cuDNN 9 usadas pelo
+Faster-Whisper na GPU NVIDIA. Elas ficam no ambiente virtual do projeto; o app
+adiciona os diretórios dessas DLLs ao caminho de busca ao iniciar uma sessão.
 
 Se `.venv` já existir, não é necessário executar `uv venv` novamente. Se o
 comando perguntar se deve substituir o ambiente, responda `n` para mantê-lo.
@@ -51,6 +56,11 @@ Outras configurações opcionais podem ser definidas por variáveis de ambiente:
 | `PIPER_VOICE` | `pt_BR-faber-medium` | Voz Piper |
 | `AUDIO_INPUT_DEVICE` | Entrada padrão do Windows | Substituição opcional por índice ou nome do dispositivo |
 | `AUDIO_INPUT_GAIN` | `4.0` | Ganho fixo do microfone com proteção contra clipping; ajuste se necessário |
+
+Por padrão, o Whisper usa CUDA na GPU NVIDIA. Se as DLLs CUDA necessárias não
+estiverem disponíveis, o app informa isso no log e não inicia uma sessão de voz.
+Para executar explicitamente em CPU, defina `WHISPER_DEVICE=cpu` e
+`WHISPER_COMPUTE_TYPE=int8`.
 
 O código valida que a URL do LM Studio aponta para `localhost`, `127.0.0.1` ou
 `::1`. Isso impede o envio das conversas para um endpoint remoto. Os modelos de
@@ -89,6 +99,16 @@ Ao iniciar uma sessão, o log `application.log` informa quando o microfone
 entrega áudio, quando o Whisper conclui uma transcrição e quando o LM Studio
 começa a responder. Se não aparecer a mensagem de áudio do microfone, selecione
 o microfone correto como entrada padrão nas configurações de som do Windows.
+
+No menu da bandeja, use **Idioma da conversa (próxima sessão)** para escolher
+português do Brasil, inglês dos Estados Unidos ou espanhol. O idioma selecionado
+configura a transcrição do Whisper e o idioma de resposta do assistente. O menu
+**Voz (próxima sessão)** mostra somente vozes Piper disponíveis para esse idioma.
+Idioma e vozes selecionadas ficam salvos na seção `[conversation]` de
+`config.toml`; a seleção de microfone continua em
+`%LOCALAPPDATA%\WindAgent\settings.json`. As escolhas de conversa passam a valer
+na próxima sessão; os modelos de voz podem ser baixados pelo Piper na primeira
+utilização.
 
 > **Distribuição:** a integração Piper em processo usa `piper-tts`, licenciado
 > sob GPL-3.0. Avalie as obrigações da licença antes de redistribuir o

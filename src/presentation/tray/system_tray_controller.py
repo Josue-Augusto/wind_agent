@@ -14,28 +14,55 @@ class SystemTrayController:
         audio_input_devices: Sequence[tuple[int, str]],
         selected_audio_input_device: int,
         on_select_audio_input_device: Callable[[int], None],
+        conversation_languages: Sequence[tuple[str, str]],
+        selected_conversation_language: str,
+        voices_by_language: dict[str, Sequence[tuple[str, str]]],
+        selected_voice: str,
+        selected_voices_by_language: dict[str, str],
+        on_select_conversation_language: Callable[[str], None],
+        on_select_voice: Callable[[str], None],
     ) -> None:
         self._audio_input_devices = tuple(audio_input_devices)
         self._selected_audio_input_device = selected_audio_input_device
         self._on_select_audio_input_device = on_select_audio_input_device
-        menu = pystray.Menu(
-            pystray.MenuItem("Iniciar/parar sessão", self._handle_toggle),
-            pystray.MenuItem(
-                "Microfone (próxima sessão)", self._create_audio_input_menu()
-            ),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Sair", self._handle_exit),
-        )
+        self._conversation_languages = tuple(conversation_languages)
+        self._selected_conversation_language = selected_conversation_language
+        self._voices_by_language = {
+            language: tuple(voices)
+            for language, voices in voices_by_language.items()
+        }
+        self._selected_voice = selected_voice
+        self._selected_voices_by_language = dict(selected_voices_by_language)
+        self._on_select_conversation_language = on_select_conversation_language
+        self._on_select_voice = on_select_voice
         self._icon = pystray.Icon(
             "wind_agent",
             self._create_icon_image(),
             "Assistente de voz",
-            menu,
+            self._create_menu(),
         )
         self._on_toggle_session = on_toggle_session
         self._on_exit = on_exit
         self._lock = RLock()
         self._started = False
+
+    def _create_menu(self) -> pystray.Menu:
+        return pystray.Menu(
+            pystray.MenuItem("Iniciar/parar sessão", self._handle_toggle),
+            pystray.MenuItem(
+                "Microfone (próxima sessão)", self._create_audio_input_menu()
+            ),
+            pystray.MenuItem(
+                "Idioma da conversa (próxima sessão)",
+                self._create_conversation_language_menu(),
+            ),
+            pystray.MenuItem(
+                "Voz (próxima sessão)",
+                self._create_voice_menu(),
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Sair", self._handle_exit),
+        )
 
     def start(self) -> None:
         with self._lock:
@@ -93,8 +120,71 @@ class SystemTrayController:
             for device_index, label in self._audio_input_devices
         ]
         if not items:
-            items.append(pystray.MenuItem("Nenhum microfone disponível", None, enabled=False))
+            items.append(
+                pystray.MenuItem(
+                    "Nenhum microfone disponível", None, enabled=False
+                )
+            )
         return pystray.Menu(*items)
+
+    def _create_conversation_language_menu(self) -> pystray.Menu:
+        def make_action(language: str) -> Callable:
+            def select_language(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+                self._selected_conversation_language = language
+                voices = self._voices_by_language.get(language, ())
+                if voices:
+                    self._selected_voice = self._selected_voices_by_language.get(
+                        language, voices[0][0]
+                    )
+                self._on_select_conversation_language(language)
+                icon.menu = self._create_menu()
+                icon.update_menu()
+
+            return select_language
+
+        return pystray.Menu(
+            *(
+                pystray.MenuItem(
+                    label,
+                    make_action(language),
+                    checked=lambda item, code=language: (
+                        code == self._selected_conversation_language
+                    ),
+                    radio=True,
+                )
+                for language, label in self._conversation_languages
+            )
+        )
+
+    def _create_voice_menu(self) -> pystray.Menu:
+        voices = self._voices_by_language.get(
+            self._selected_conversation_language, ()
+        )
+
+        def make_action(voice: str) -> Callable:
+            def select_voice(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+                self._selected_voice = voice
+                self._selected_voices_by_language[
+                    self._selected_conversation_language
+                ] = voice
+                self._on_select_voice(voice)
+                icon.update_menu()
+
+            return select_voice
+
+        return pystray.Menu(
+            *(
+                pystray.MenuItem(
+                    label,
+                    make_action(voice),
+                    checked=lambda item, voice_id=voice: (
+                        voice_id == self._selected_voice
+                    ),
+                    radio=True,
+                )
+                for voice, label in voices
+            )
+        )
 
     def _handle_exit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         try:

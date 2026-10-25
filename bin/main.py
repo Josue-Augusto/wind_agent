@@ -128,12 +128,49 @@ async def _run_application() -> None:
         except RuntimeError as error:
             _LOGGER.warning("Could not schedule audio device selection: %s", error)
 
+    def _select_conversation_language(language: str) -> None:
+        try:
+            datasource.select_conversation_language(language)
+            _LOGGER.info(
+                "Conversation language set to %s for future sessions.", language
+            )
+        except ValueError as error:
+            _LOGGER.error(
+                "Could not select conversation language %s: %s", language, error
+            )
+
+    def _schedule_conversation_language_selection(language: str) -> None:
+        try:
+            loop.call_soon_threadsafe(_select_conversation_language, language)
+        except RuntimeError as error:
+            _LOGGER.warning("Could not schedule language selection: %s", error)
+
+    def _select_voice(voice: str) -> None:
+        try:
+            datasource.select_voice(voice)
+            _LOGGER.info("Piper voice %s selected for future sessions.", voice)
+        except ValueError as error:
+            _LOGGER.error("Could not select Piper voice %s: %s", voice, error)
+
+    def _schedule_voice_selection(voice: str) -> None:
+        try:
+            loop.call_soon_threadsafe(_select_voice, voice)
+        except RuntimeError as error:
+            _LOGGER.warning("Could not schedule voice selection: %s", error)
+
     tray = SystemTrayController(
         _schedule_toggle_session,
         _request_shutdown,
         datasource.get_audio_input_devices(),
         datasource.get_selected_audio_input_device(),
         _schedule_audio_input_device_selection,
+        datasource.get_conversation_languages(),
+        datasource.get_selected_conversation_language(),
+        datasource.get_voices_by_language(),
+        datasource.get_selected_voice(),
+        datasource.get_selected_voices_by_language(),
+        _schedule_conversation_language_selection,
+        _schedule_voice_selection,
     )
     hotkey = HotkeyListener(_schedule_toggle_session)
     tray.set_agent_state(repository.get_state().value)

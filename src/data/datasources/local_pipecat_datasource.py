@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import logging
 import math
 import os
+import sys
 import time
 import tomllib
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Any, TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -22,6 +25,7 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from src.domain.entities.agent_state import AgentState
 from pipecat.frames.frames import (
     Frame,
+    ErrorFrame,
     InputAudioRawFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -34,7 +38,10 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.audio.vad_processor import VADProcessor
+from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy, VADUserTurnStartStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 if TYPE_CHECKING:
     from pipecat.pipeline.worker import PipelineWorker
@@ -43,10 +50,81 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_SESSION_DRAIN_TIMEOUT_SECS = 60.0
 _CONFIG_FILE = Path(__file__).resolve().parents[3] / "config.toml"
-_AUDIO_SETTINGS_FILE = Path(
+_USER_SETTINGS_FILE = Path(
     os.getenv("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
 ) / "WindAgent" / "settings.json"
+_CONVERSATION_LANGUAGES = {
+    "pt": ("Português (Brasil)", "pt_BR-faber-medium"),
+    "en": ("English (US)", "en_US-lessac-medium"),
+    "es": ("Español", "es_ES-davefx-medium"),
+}
+_PIPER_VOICES = {
+    "pt": (
+        ("pt_BR-faber-medium", "Faber (média)"),
+        ("pt_BR-cadu-medium", "Cadu (média)"),
+        ("pt_BR-edresson-low", "Edresson (leve)"),
+    ),
+    "en": (
+        ("en_US-lessac-medium", "Lessac (média)"),
+        ("en_US-amy-medium", "Amy (média)"),
+        ("en_US-ryan-medium", "Ryan (média)"),
+    ),
+    "es": (
+        ("es_ES-davefx-medium", "Davefx (média)"),
+        ("es_MX-ald-medium", "Ald (média, México)"),
+    ),
+}
+_WHISPER_LANGUAGES = {"pt": "PT", "en": "EN", "es": "ES"}
+_SYSTEM_PROMPTS = {
+    "pt": "Você é um assistente de voz. Responda sempre em português brasileiro, de forma clara e concisa.",
+    "en": "You are a voice assistant. Always respond in English, clearly and concisely.",
+    "es": "Eres un asistente de voz. Responde siempre en español, de forma clara y concisa.",
+}
+_CUDA_DLL_DIRECTORY_HANDLES: list[Any] = []
+
+
+def _configure_cuda_runtime(device: str) -> None:
+    if device.casefold() != "cuda" or os.name != "nt":
+        return
+
+    site_packages = Path(sys.prefix) / "Lib" / "site-packages"
+    dll_directories = [
+        site_packages / "nvidia" / "cublas" / "bin",
+        site_packages / "nvidia" / "cuda_runtime" / "bin",
+        site_packages / "nvidia" / "cudnn" / "bin",
+        site_packages / "ctranslate2",
+    ]
+    for variable_name in ("CUDA_PATH", "CUDA_PATH_V12_9", "CUDA_PATH_V12_8"):
+        cuda_path = os.getenv(variable_name)
+        if cuda_path:
+            dll_directories.append(Path(cuda_path) / "bin")
+
+    toolkit_root = Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA")
+    if toolkit_root.is_dir():
+        dll_directories.extend(toolkit_root.glob("v12.*/bin"))
+
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    for directory in dll_directories:
+        if not directory.is_dir():
+            continue
+        directory_text = str(directory)
+        if directory_text.casefold() not in {
+            entry.casefold() for entry in path_entries
+        }:
+            path_entries.insert(0, directory_text)
+            _CUDA_DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(directory_text))
+    os.environ["PATH"] = os.pathsep.join(path_entries)
+
+    try:
+        ctypes.WinDLL("cublas64_12.dll")
+    except OSError as error:
+        raise RuntimeError(
+            "Whisper is configured to use the NVIDIA GPU, but CUDA 12 cuBLAS "
+            "could not be loaded. Install the NVIDIA runtime dependencies from "
+            "requirements-cuda.txt and restart the application."
+        ) from error
 
 
 @dataclass(frozen=True)
@@ -138,6 +216,7 @@ class _SoundDeviceInputProcessor(FrameProcessor):
         self._device = device
         self._capture_channels = capture_channels
         self._gain = gain
+        self._bot_speaking = Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream: sd.InputStream | None = None
         self._active = False
@@ -184,12 +263,23 @@ class _SoundDeviceInputProcessor(FrameProcessor):
         if isinstance(frame, StartFrame):
             self._active = True
 
+    def set_bot_speaking(self, speaking: bool) -> None:
+        if speaking:
+            self._bot_speaking.set()
+        else:
+            self._bot_speaking.clear()
+
     def _on_audio(self, audio, frame_count, time_info, status) -> None:
         if status:
             _LOGGER.warning("Microphone audio callback reported: %s", status)
 
         loop = self._loop
-        if not self._active or loop is None or loop.is_closed():
+        if (
+            not self._active
+            or self._bot_speaking.is_set()
+            or loop is None
+            or loop.is_closed()
+        ):
             return
 
         if not self._first_audio_frame_logged:
@@ -261,6 +351,7 @@ class _SoundDeviceInputProcessor(FrameProcessor):
 
     async def cleanup(self) -> None:
         self._active = False
+        self._bot_speaking.clear()
         stream, self._stream = self._stream, None
         try:
             if stream is not None:
@@ -321,9 +412,14 @@ class _SoundDeviceOutputProcessor(FrameProcessor):
 
 
 class _AgentStateProcessor(FrameProcessor):
-    def __init__(self, on_state_change: Callable[[AgentState], None]) -> None:
+    def __init__(
+        self,
+        on_state_change: Callable[[AgentState], None],
+        on_bot_speaking_change: Callable[[bool], None],
+    ) -> None:
         super().__init__()
         self._on_state_change = on_state_change
+        self._on_bot_speaking_change = on_bot_speaking_change
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -336,8 +432,12 @@ class _AgentStateProcessor(FrameProcessor):
                 _LOGGER.info("LM Studio started generating a response.")
                 self._on_state_change(AgentState.PROCESSING)
             elif isinstance(frame, TTSStartedFrame):
+                self._on_bot_speaking_change(True)
                 self._on_state_change(AgentState.SPEAKING)
-            elif isinstance(frame, (TTSStoppedFrame, LLMFullResponseEndFrame)):
+            elif isinstance(frame, TTSStoppedFrame):
+                self._on_bot_speaking_change(False)
+                self._on_state_change(AgentState.LISTENING)
+            elif isinstance(frame, LLMFullResponseEndFrame):
                 self._on_state_change(AgentState.LISTENING)
         await self.push_frame(frame, direction)
 
@@ -357,6 +457,8 @@ class _TranscriptionLoggingProcessor(FrameProcessor):
                 len(frame.text.strip()),
             )
             self._on_state_change(AgentState.PROCESSING)
+        elif isinstance(frame, ErrorFrame):
+            _LOGGER.error("Pipecat pipeline reported an error: %s", frame.error)
         await self.push_frame(frame, direction)
 
 
@@ -395,6 +497,45 @@ class LocalPipecatDataSource:
         self._settings = settings or LocalPipecatSettings.from_environment()
         self._audio_devices = self._discover_audio_input_devices()
         self._audio_input_device = self._resolve_initial_audio_input_device()
+        conversation_settings = self._load_conversation_settings()
+        saved_language = conversation_settings.get("language")
+        self._conversation_language = (
+            saved_language if saved_language in _CONVERSATION_LANGUAGES else "pt"
+        )
+        saved_voices = conversation_settings.get("piper_voices", {})
+        if not isinstance(saved_voices, dict):
+            saved_voices = {}
+        self._voices_by_language = {
+            language: list(voices) for language, voices in _PIPER_VOICES.items()
+        }
+        configured_voice = self._settings.piper_voice
+        voice_prefixes = {
+            "pt": "pt_BR-",
+            "en": "en_US-",
+            "es": ("es_ES-", "es_MX-"),
+        }
+        for language in self._voices_by_language:
+            configured_voice_matches_language = configured_voice.startswith(
+                voice_prefixes[language]
+            )
+            configured_voice_is_listed = configured_voice in {
+                voice for voice, _ in self._voices_by_language[language]
+            }
+            if configured_voice_matches_language and not configured_voice_is_listed:
+                self._voices_by_language[language].append(
+                    (configured_voice, configured_voice)
+                )
+        self._selected_voices_by_language = {}
+        for language, voices in self._voices_by_language.items():
+            voice_ids = {voice for voice, _ in voices}
+            selected = saved_voices.get(language)
+            if selected not in voice_ids:
+                selected = (
+                    self._settings.piper_voice
+                    if self._settings.piper_voice in voice_ids
+                    else _CONVERSATION_LANGUAGES[language][1]
+                )
+            self._selected_voices_by_language[language] = selected
         self._on_state_change = on_state_change
         self._session_lock = asyncio.Lock()
         self._runner_task: asyncio.Task[None] | None = None
@@ -539,13 +680,17 @@ class LocalPipecatDataSource:
         return None
 
     @staticmethod
-    def _load_saved_audio_device() -> dict[str, str] | None:
+    def _load_saved_audio_settings() -> dict[str, Any]:
         try:
-            settings = json.loads(_AUDIO_SETTINGS_FILE.read_text(encoding="utf-8"))
+            settings = json.loads(_USER_SETTINGS_FILE.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return None
-        audio_device = (
-            settings.get("audio_input_device") if isinstance(settings, dict) else None
+            return {}
+        return settings if isinstance(settings, dict) else {}
+
+    @staticmethod
+    def _load_saved_audio_device() -> dict[str, str] | None:
+        audio_device = LocalPipecatDataSource._load_saved_audio_settings().get(
+            "audio_input_device"
         )
         if (
             isinstance(audio_device, dict)
@@ -554,6 +699,100 @@ class LocalPipecatDataSource:
         ):
             return audio_device
         return None
+
+    @staticmethod
+    def _save_user_settings(updates: dict[str, Any]) -> None:
+        settings = LocalPipecatDataSource._load_saved_audio_settings()
+        settings.update(updates)
+        try:
+            _USER_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            temporary_file = _USER_SETTINGS_FILE.with_suffix(".tmp")
+            temporary_file.write_text(
+                json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            temporary_file.replace(_USER_SETTINGS_FILE)
+        except OSError:
+            _LOGGER.exception("Could not save user settings.")
+
+    @staticmethod
+    def _load_conversation_settings() -> dict[str, Any]:
+        try:
+            with _CONFIG_FILE.open("rb") as config_file:
+                config = tomllib.load(config_file)
+        except (OSError, tomllib.TOMLDecodeError):
+            _LOGGER.exception(
+                "Could not read conversation settings from %s.", _CONFIG_FILE
+            )
+            return {}
+        conversation = config.get("conversation", {})
+        return conversation if isinstance(conversation, dict) else {}
+
+    @staticmethod
+    def _save_conversation_settings(updates: dict[str, Any]) -> None:
+        try:
+            contents = _CONFIG_FILE.read_text(encoding="utf-8")
+            lines = contents.splitlines()
+            section_start = next(
+                (
+                    index
+                    for index, line in enumerate(lines)
+                    if line.strip() == "[conversation]"
+                ),
+                None,
+            )
+            if section_start is None:
+                if lines and lines[-1].strip():
+                    lines.append("")
+                lines.append("[conversation]")
+                section_start = len(lines) - 1
+                section_end = len(lines)
+            else:
+                section_end = next(
+                    (
+                        index
+                        for index in range(section_start + 1, len(lines))
+                        if lines[index].lstrip().startswith("[")
+                    ),
+                    len(lines),
+                )
+
+            existing = LocalPipecatDataSource._load_conversation_settings()
+            existing.update(updates)
+            selected_voices = existing.get("piper_voices", {})
+            if not isinstance(selected_voices, dict):
+                selected_voices = {}
+            serialized = {
+                "language": json.dumps(existing["language"], ensure_ascii=False),
+                "piper_voices": "{ "
+                + ", ".join(
+                    f"{language} = {json.dumps(voice, ensure_ascii=False)}"
+                    for language, voice in selected_voices.items()
+                )
+                + " }",
+            }
+            for key, value in serialized.items():
+                setting_index = next(
+                    (
+                        index
+                        for index in range(section_start + 1, section_end)
+                        if lines[index].partition("=")[0].strip() == key
+                    ),
+                    None,
+                )
+                setting_line = f"{key} = {value}"
+                if setting_index is None:
+                    lines.insert(section_end, setting_line)
+                    section_end += 1
+                else:
+                    lines[setting_index] = setting_line
+
+            temporary_file = _CONFIG_FILE.with_suffix(".toml.tmp")
+            temporary_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            temporary_file.replace(_CONFIG_FILE)
+        except (OSError, KeyError, TypeError):
+            _LOGGER.exception(
+                "Could not save conversation settings to %s.", _CONFIG_FILE
+            )
 
     def get_selected_audio_input_device(self) -> int:
         return self._audio_input_device
@@ -574,22 +813,61 @@ class LocalPipecatDataSource:
         if selected_device is None:
             raise ValueError(f"Audio input device {device_index} is unavailable.")
         self._audio_input_device = device_index
-        settings = {
-            "audio_input_device": {
-                "name": selected_device["name"],
-                "host_api": selected_device["host_api"],
+        self._save_user_settings(
+            {
+                "audio_input_device": {
+                    "name": selected_device["name"],
+                    "host_api": selected_device["host_api"],
+                }
             }
+        )
+
+    def get_conversation_languages(self) -> list[tuple[str, str]]:
+        return [(code, details[0]) for code, details in _CONVERSATION_LANGUAGES.items()]
+
+    def get_selected_conversation_language(self) -> str:
+        return self._conversation_language
+
+    def get_voices_by_language(self) -> dict[str, list[tuple[str, str]]]:
+        return {
+            language: list(voices)
+            for language, voices in self._voices_by_language.items()
         }
-        try:
-            _AUDIO_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            temporary_file = _AUDIO_SETTINGS_FILE.with_suffix(".tmp")
-            temporary_file.write_text(
-                json.dumps(settings, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+
+    def get_selected_voice(self) -> str:
+        return self._selected_voices_by_language[self._conversation_language]
+
+    def get_selected_voices_by_language(self) -> dict[str, str]:
+        return dict(self._selected_voices_by_language)
+
+    def select_conversation_language(self, language: str) -> None:
+        if language not in _CONVERSATION_LANGUAGES:
+            raise ValueError(f"Unsupported conversation language: {language}")
+        self._conversation_language = language
+        self._save_conversation_settings(
+            {
+                "language": language,
+                "piper_voices": self._selected_voices_by_language,
+            }
+        )
+
+    def select_voice(self, voice: str) -> None:
+        available_voices = {
+            voice_id
+            for voice_id, _ in self._voices_by_language[self._conversation_language]
+        }
+        if voice not in available_voices:
+            raise ValueError(
+                f"Voice {voice!r} is not available for language "
+                f"{self._conversation_language!r}."
             )
-            temporary_file.replace(_AUDIO_SETTINGS_FILE)
-        except OSError:
-            _LOGGER.exception("Could not save the selected audio input device.")
+        self._selected_voices_by_language[self._conversation_language] = voice
+        self._save_conversation_settings(
+            {
+                "language": self._conversation_language,
+                "piper_voices": self._selected_voices_by_language,
+            }
+        )
 
     def set_state_listener(
         self, listener: Callable[[AgentState], None] | None
@@ -601,6 +879,8 @@ class LocalPipecatDataSource:
             if self._runner_task is not None and not self._runner_task.done():
                 raise RuntimeError("A Pipecat voice session is already running.")
             await self._clear_finished_session()
+
+            _configure_cuda_runtime(self._settings.whisper_device)
 
             from pipecat.pipeline.pipeline import Pipeline
             from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -625,27 +905,36 @@ class LocalPipecatDataSource:
                 compute_type=self._settings.whisper_compute_type,
                 settings=WhisperSTTService.Settings(
                     model=self._settings.whisper_model,
-                    language=Language.PT,
+                    language=getattr(Language, _WHISPER_LANGUAGES[self._conversation_language]),
+                    no_speech_prob=1.0,
                 ),
                 sample_rate=self._settings.audio_sample_rate,
                 num_channels=self._settings.audio_channels,
             )
             tts = PiperTTSService(
-                settings=PiperTTSService.Settings(voice=self._settings.piper_voice)
+                settings=PiperTTSService.Settings(voice=self.get_selected_voice())
             )
 
             context = LLMContext(
                 [
                     {
                         "role": "system",
-                        "content": (
-                            "Você é um assistente de voz. Responda sempre em "
-                            "português brasileiro, de forma clara e concisa."
-                        ),
+                        "content": _SYSTEM_PROMPTS[self._conversation_language],
                     }
                 ]
             )
-            context_aggregator = LLMContextAggregatorPair(context)
+            context_aggregator = LLMContextAggregatorPair(
+                context,
+                user_params=LLMUserAggregatorParams(
+                    user_turn_strategies=UserTurnStrategies(
+                        start=[
+                            VADUserTurnStartStrategy(enable_interruptions=False),
+                            TranscriptionUserTurnStartStrategy(),
+                        ]
+                    ),
+                    empty_user_turn=None,
+                ),
+            )
             input_processor = _SoundDeviceInputProcessor(
                 self._settings.audio_sample_rate,
                 self._settings.audio_channels,
@@ -661,7 +950,10 @@ class LocalPipecatDataSource:
             )
             output_processor = _SoundDeviceOutputProcessor()
             transcription_processor = _TranscriptionLoggingProcessor(self._notify_state)
-            state_processor = _AgentStateProcessor(self._notify_state)
+            state_processor = _AgentStateProcessor(
+                self._notify_state,
+                input_processor.set_bot_speaking,
+            )
             try:
                 pipeline = Pipeline(
                     [
@@ -726,6 +1018,17 @@ class LocalPipecatDataSource:
                 await self._cleanup_input_processor()
                 pipeline_worker = self._pipeline_worker
                 if not runner_task.done() and pipeline_worker is not None:
+                    _LOGGER.info(
+                        "Waiting for the current transcription and response to finish before stopping the session."
+                    )
+                    drained = await pipeline_worker.flush_pipeline(
+                        timeout=_SESSION_DRAIN_TIMEOUT_SECS
+                    )
+                    if not drained:
+                        _LOGGER.warning(
+                            "The voice turn did not finish within %.0f seconds; stopping the pipeline anyway.",
+                            _SESSION_DRAIN_TIMEOUT_SECS,
+                        )
                     await pipeline_worker.end(reason="Voice session stopped by user")
                 await runner_task
             finally:

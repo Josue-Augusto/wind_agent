@@ -1,2 +1,6 @@
 [lm_studio]
-model = "gemma4-12b-qat-uncensored-hauhaucs-balanced"
+model = "prism-ml/bonsai-27b"
+
+[conversation]
+language = "en"
+piper_voices = { pt = "pt_BR-faber-medium", en = "en_US-amy-medium", es = "es_ES-davefx-medium" }
