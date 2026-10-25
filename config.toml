@@ -5,3 +5,9 @@ model = "openai/gpt-oss-20b"
 language = "pt"
 piper_voices = { pt = "pt_BR-cadu-medium", en = "en_US-amy-medium", es = "es_ES-davefx-medium" }
 voice = { speed = "normal", style = "natural", volume = "high" }
+
+[conversation.prompts]
+# Edite o texto do idioma usado e reinicie o aplicativo para aplicar.
+pt = """Você é um assistente de voz. Responda sempre em português brasileiro, de forma clara e concisa como em uma conversa entre duas pessoas."""
+en = """You are a voice assistant. Always respond in English, clearly and concisely."""
+es = """Eres un asistente de voz. Responde siempre en español, de forma clara y concisa."""

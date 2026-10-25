@@ -92,11 +92,6 @@ _VOICE_VOLUMES = {
     "high": ("Alto", 1.0),
 }
 _WHISPER_LANGUAGES = {"pt": "PT", "en": "EN", "es": "ES"}
-_SYSTEM_PROMPTS = {
-    "pt": "Você é um assistente de voz. Responda sempre em português brasileiro, de forma clara e concisa.",
-    "en": "You are a voice assistant. Always respond in English, clearly and concisely.",
-    "es": "Eres un asistente de voz. Responde siempre en español, de forma clara y concisa.",
-}
 _CUDA_DLL_DIRECTORY_HANDLES: list[Any] = []
 
 
@@ -513,6 +508,10 @@ class LocalPipecatDataSource:
         self._audio_devices = self._discover_audio_input_devices()
         self._audio_input_device = self._resolve_initial_audio_input_device()
         conversation_settings = self._load_conversation_settings()
+        configured_prompts = conversation_settings.get("prompts", {})
+        self._system_prompts = (
+            configured_prompts if isinstance(configured_prompts, dict) else {}
+        )
         saved_language = conversation_settings.get("language")
         self._conversation_language = (
             saved_language if saved_language in _CONVERSATION_LANGUAGES else "pt"
@@ -975,6 +974,13 @@ class LocalPipecatDataSource:
                 raise RuntimeError("A Pipecat voice session is already running.")
             await self._clear_finished_session()
 
+            system_prompt = self._system_prompts.get(self._conversation_language)
+            if not isinstance(system_prompt, str) or not system_prompt.strip():
+                raise ValueError(
+                    "Set a non-empty prompt for the selected language in "
+                    "[conversation.prompts] in config.toml."
+                )
+
             _configure_cuda_runtime(self._settings.whisper_device)
 
             from pipecat.pipeline.pipeline import Pipeline
@@ -1065,7 +1071,7 @@ class LocalPipecatDataSource:
                 [
                     {
                         "role": "system",
-                        "content": _SYSTEM_PROMPTS[self._conversation_language],
+                        "content": system_prompt.strip(),
                     }
                 ]
             )

@@ -115,6 +115,10 @@ ou rápida; estilo estável, natural ou expressivo; e volume suave, médio ou al
 O estilo ajusta a variação da síntese Piper, não controla diretamente o pitch.
 As três preferências também ficam em `[conversation].voice` no `config.toml`.
 
+Os prompts do sistema ficam em `[conversation.prompts]` no mesmo arquivo, com
+uma chave para cada idioma (`pt`, `en` e `es`). Edite o texto da chave do idioma
+que usa e reinicie o aplicativo para carregar o prompt personalizado.
+
 > **Distribuição:** a integração Piper em processo usa `piper-tts`, licenciado
 > sob GPL-3.0. Avalie as obrigações da licença antes de redistribuir o
 > aplicativo.
