@@ -197,6 +197,19 @@ async def _run_application() -> None:
         except RuntimeError as error:
             _LOGGER.warning("Could not schedule voice volume selection: %s", error)
 
+    def _select_llm_provider(provider: str) -> None:
+        try:
+            datasource.select_llm_provider(provider)
+            _LOGGER.info("LLM provider %s selected for future sessions.", provider)
+        except (OSError, ValueError) as error:
+            _LOGGER.error("Could not select LLM provider %s: %s", provider, error)
+
+    def _schedule_llm_provider_selection(provider: str) -> None:
+        try:
+            loop.call_soon_threadsafe(_select_llm_provider, provider)
+        except RuntimeError as error:
+            _LOGGER.warning("Could not schedule LLM provider selection: %s", error)
+
     tray = SystemTrayController(
         _schedule_toggle_session,
         _request_shutdown,
@@ -219,6 +232,9 @@ async def _run_application() -> None:
         datasource.get_voice_volume_options(),
         datasource.get_voice_adjustments()["volume"],
         _schedule_voice_volume_selection,
+        datasource.get_llm_providers(),
+        datasource.get_selected_llm_provider(),
+        _schedule_llm_provider_selection,
     )
     hotkey = HotkeyListener(_schedule_toggle_session)
     tray.set_agent_state(repository.get_state().value)

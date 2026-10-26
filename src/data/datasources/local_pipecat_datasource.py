@@ -11,7 +11,7 @@ import time
 import tomllib
 from collections.abc import AsyncGenerator, Callable, Iterable, Iterator
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -49,6 +49,16 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_LLM_PROVIDER_LABELS = {
+    "lm_studio": "LM Studio",
+    "openrouter": "OpenRouter",
+    "openai": "OpenAI",
+}
+_LLM_PROVIDER_URLS = {
+    "lm_studio": "http://localhost:1234/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "openai": "https://api.openai.com/v1",
+}
 _SESSION_DRAIN_TIMEOUT_SECS = 60.0
 _CONFIG_FILE = Path(__file__).resolve().parents[3] / "config.toml"
 _USER_SETTINGS_FILE = Path(
@@ -92,6 +102,65 @@ _VOICE_VOLUMES = {
 }
 _WHISPER_LANGUAGES = {"pt": "PT", "en": "EN", "es": "ES"}
 _CUDA_DLL_DIRECTORY_HANDLES: list[Any] = []
+
+
+def _load_llm_profiles() -> tuple[str, dict[str, dict[str, Any]]]:
+    try:
+        with _CONFIG_FILE.open("rb") as config_file:
+            config = tomllib.load(config_file)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"Required configuration file not found: {_CONFIG_FILE}"
+        ) from error
+
+    llm_config = config.get("llm")
+    if not isinstance(llm_config, dict):
+        legacy = config.get("lm_studio", {})
+        llm_config = {"provider": "lm_studio", **(legacy if isinstance(legacy, dict) else {})}
+
+    providers = llm_config.get("providers")
+    if isinstance(providers, dict) and providers:
+        profiles = {
+            str(provider).strip().lower(): values
+            for provider, values in providers.items()
+            if isinstance(values, dict)
+        }
+        if not profiles:
+            raise ValueError(f"No valid provider profiles are configured in {_CONFIG_FILE}.")
+        selected = str(llm_config.get("selected_provider", next(iter(profiles)))).strip().lower()
+    else:
+        # Accept the original single-provider layout for existing config files.
+        selected = str(llm_config.get("provider", "lm_studio")).strip().lower()
+        profiles = {
+            selected: {
+                key: value
+                for key, value in llm_config.items()
+                if key not in {"provider", "selected_provider"}
+            }
+        }
+
+    if selected not in profiles:
+        raise ValueError(
+            f"Selected provider '{selected}' is not configured in [llm.providers]."
+        )
+    for provider, profile in profiles.items():
+        if not isinstance(profile, dict):
+            raise ValueError(f"Provider profile '{provider}' must be a TOML table.")
+        if not profile.get("base_url"):
+            profile["base_url"] = _LLM_PROVIDER_URLS.get(provider, "")
+        if not isinstance(profile.get("base_url"), str) or not profile["base_url"]:
+            raise ValueError(f"Set base_url for provider '{provider}' in config.toml.")
+        model = profile.get("model")
+        if model is not None and not isinstance(model, str):
+            raise ValueError(f"Set model as a string for provider '{provider}'.")
+        if isinstance(model, str) and not model.strip():
+            profile["model"] = None
+        api_key = profile.get("api_key")
+        if api_key is not None and not isinstance(api_key, str):
+            raise ValueError(f"Set api_key as a string for provider '{provider}'.")
+        if api_key is None and isinstance(profile.get("api_key_env"), str):
+            profile["api_key"] = os.getenv(profile["api_key_env"])
+    return selected, profiles
 
 
 def _configure_cuda_runtime(device: str) -> None:
@@ -138,8 +207,10 @@ def _configure_cuda_runtime(device: str) -> None:
 
 @dataclass(frozen=True)
 class LocalPipecatSettings:
-    lm_studio_base_url: str = "http://localhost:1234/v1"
-    lm_studio_model: str | None = None
+    llm_provider: str = "lm_studio"
+    llm_base_url: str = "http://localhost:1234/v1"
+    llm_model: str | None = None
+    llm_api_key: str | None = None
     whisper_model: str = "small"
     whisper_device: str = "cuda"
     whisper_compute_type: str = "float16"
@@ -150,12 +221,13 @@ class LocalPipecatSettings:
     audio_channels: int = 1
 
     def __post_init__(self) -> None:
-        parsed_url = urlsplit(self.lm_studio_base_url)
-        if (
-            parsed_url.scheme not in {"http", "https"}
-            or parsed_url.hostname not in _LOCAL_HOSTS
-        ):
-            raise ValueError("LM Studio must use a localhost URL to keep inference local.")
+        if not self.llm_provider.strip():
+            raise ValueError("llm_provider cannot be empty.")
+        parsed_url = urlsplit(self.llm_base_url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+            raise ValueError("llm_base_url must be an absolute HTTP(S) URL.")
+        if self.llm_provider == "lm_studio" and parsed_url.hostname not in _LOCAL_HOSTS:
+            raise ValueError("LM Studio must use a localhost URL.")
         if self.audio_sample_rate <= 0:
             raise ValueError("audio_sample_rate must be greater than zero.")
         if self.audio_channels != 1:
@@ -166,41 +238,25 @@ class LocalPipecatSettings:
             raise ValueError("whisper_model cannot be empty.")
         if not self.piper_voice.strip():
             raise ValueError("piper_voice cannot be empty.")
-        if self.lm_studio_model is not None and not self.lm_studio_model.strip():
-            raise ValueError("lm_studio_model cannot be empty when provided.")
+        if self.llm_model is not None and not self.llm_model.strip():
+            raise ValueError("llm_model cannot be empty when provided.")
         if not self.whisper_device.strip() or not self.whisper_compute_type.strip():
             raise ValueError("Whisper device and compute type cannot be empty.")
 
     @classmethod
     def from_environment(cls) -> "LocalPipecatSettings":
-        try:
-            with _CONFIG_FILE.open("rb") as config_file:
-                config = tomllib.load(config_file)
-        except FileNotFoundError as error:
-            raise FileNotFoundError(
-                f"Required configuration file not found: {_CONFIG_FILE}"
-            ) from error
-
-        lm_studio_config = config.get("lm_studio")
-        if not isinstance(lm_studio_config, dict):
-            raise ValueError(
-                f"Missing [lm_studio] section in configuration file: {_CONFIG_FILE}"
-            )
-        lm_studio_model = lm_studio_config.get("model")
-        if not isinstance(lm_studio_model, str) or not lm_studio_model.strip():
-            raise ValueError(
-                f"Set a non-empty 'model' in [lm_studio] in {_CONFIG_FILE}"
-            )
+        provider, profiles = _load_llm_profiles()
+        profile = profiles[provider]
 
         input_device = os.getenv("AUDIO_INPUT_DEVICE")
         if input_device is not None:
             input_device = int(input_device) if input_device.isdecimal() else input_device
 
         return cls(
-            lm_studio_base_url=os.getenv(
-                "LM_STUDIO_BASE_URL", "http://localhost:1234/v1"
-            ),
-            lm_studio_model=lm_studio_model.strip(),
+            llm_provider=provider,
+            llm_base_url=profile["base_url"],
+            llm_model=profile.get("model"),
+            llm_api_key=profile.get("api_key"),
             whisper_model=os.getenv("WHISPER_MODEL", "small"),
             whisper_device=os.getenv("WHISPER_DEVICE", "cuda"),
             whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "float16"),
@@ -412,9 +468,14 @@ class _SoundDeviceOutputProcessor(FrameProcessor):
 
 
 class _AgentStateProcessor(FrameProcessor):
-    def __init__(self, on_state_change: Callable[[AgentState], None]) -> None:
+    def __init__(
+        self,
+        on_state_change: Callable[[AgentState], None],
+        provider_name: str = "configured",
+    ) -> None:
         super().__init__()
         self._on_state_change = on_state_change
+        self._provider_name = provider_name
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -424,7 +485,10 @@ class _AgentStateProcessor(FrameProcessor):
             elif isinstance(frame, VADUserStoppedSpeakingFrame):
                 _LOGGER.info("VAD detected the end of the utterance; Whisper will transcribe it.")
             elif isinstance(frame, LLMFullResponseStartFrame):
-                _LOGGER.info("LM Studio started generating a response.")
+                _LOGGER.info(
+                    "LLM provider '%s' started generating a response.",
+                    self._provider_name,
+                )
                 self._on_state_change(AgentState.PROCESSING)
             elif isinstance(frame, TTSStartedFrame):
                 self._on_state_change(AgentState.SPEAKING)
@@ -488,6 +552,14 @@ class LocalPipecatDataSource:
         on_state_change: Callable[[AgentState], None] | None = None,
     ) -> None:
         self._settings = settings or LocalPipecatSettings.from_environment()
+        self._selected_llm_provider, self._llm_profiles = _load_llm_profiles()
+        if self._settings.llm_provider not in self._llm_profiles:
+            self._llm_profiles[self._settings.llm_provider] = {
+                "base_url": self._settings.llm_base_url,
+                "model": self._settings.llm_model,
+                "api_key": self._settings.llm_api_key,
+            }
+        self._selected_llm_provider = self._settings.llm_provider
         self._audio_devices = self._discover_audio_input_devices()
         self._audio_input_device = self._resolve_initial_audio_input_device()
         conversation_settings = self._load_conversation_settings()
@@ -849,6 +921,75 @@ class LocalPipecatDataSource:
     def get_conversation_languages(self) -> list[tuple[str, str]]:
         return [(code, details[0]) for code, details in _CONVERSATION_LANGUAGES.items()]
 
+    def get_llm_providers(self) -> list[tuple[str, str]]:
+        return [
+            (
+                provider,
+                _LLM_PROVIDER_LABELS.get(provider, provider.replace("_", " ").title()),
+            )
+            for provider in self._llm_profiles
+        ]
+
+    def get_selected_llm_provider(self) -> str:
+        return self._selected_llm_provider
+
+    def select_llm_provider(self, provider: str) -> None:
+        provider = provider.strip().lower()
+        profile = self._llm_profiles.get(provider)
+        if profile is None:
+            raise ValueError(f"LLM provider {provider!r} is not configured.")
+        updated_settings = replace(
+            self._settings,
+            llm_provider=provider,
+            llm_base_url=profile["base_url"],
+            llm_model=profile.get("model"),
+            llm_api_key=profile.get("api_key"),
+        )
+        self._save_selected_llm_provider(provider)
+        self._settings = updated_settings
+        self._selected_llm_provider = provider
+
+    @staticmethod
+    def _save_selected_llm_provider(provider: str) -> None:
+        lines = _CONFIG_FILE.read_text(encoding="utf-8").splitlines()
+        section_start = next(
+            (index for index, line in enumerate(lines) if line.strip() == "[llm]"),
+            None,
+        )
+        if section_start is None:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append("[llm]")
+            section_start = len(lines) - 1
+            section_end = len(lines)
+        else:
+            section_end = next(
+                (
+                    index
+                    for index in range(section_start + 1, len(lines))
+                    if lines[index].lstrip().startswith("[")
+                ),
+                len(lines),
+            )
+
+        selected_line = f"selected_provider = {json.dumps(provider)}"
+        selected_index = next(
+            (
+                index
+                for index in range(section_start + 1, section_end)
+                if lines[index].partition("=")[0].strip() == "selected_provider"
+            ),
+            None,
+        )
+        if selected_index is None:
+            lines.insert(section_end, selected_line)
+        else:
+            lines[selected_index] = selected_line
+
+        temporary_file = _CONFIG_FILE.with_suffix(".toml.tmp")
+        temporary_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        temporary_file.replace(_CONFIG_FILE)
+
     def get_selected_conversation_language(self) -> str:
         return self._conversation_language
 
@@ -956,6 +1097,7 @@ class LocalPipecatDataSource:
             if self._runner_task is not None and not self._runner_task.done():
                 raise RuntimeError("A Pipecat voice session is already running.")
             await self._clear_finished_session()
+            session_llm_settings = self._settings
 
             system_prompt = self._system_prompts.get(self._conversation_language)
             if not isinstance(system_prompt, str) or not system_prompt.strip():
@@ -1023,11 +1165,12 @@ class LocalPipecatDataSource:
                     finally:
                         await self.stop_ttfb_metrics()
 
-            model = await self._resolve_lm_studio_model()
+            model = await self._resolve_llm_model(session_llm_settings)
+            api_key = self._resolve_llm_api_key(session_llm_settings)
             llm = OpenAILLMService(
                 settings=OpenAILLMService.Settings(model=model),
-                api_key="lm-studio",
-                base_url=self._settings.lm_studio_base_url,
+                api_key=api_key,
+                base_url=session_llm_settings.llm_base_url,
             )
             stt = WhisperSTTService(
                 device=self._settings.whisper_device,
@@ -1087,7 +1230,9 @@ class LocalPipecatDataSource:
             )
             output_processor = _SoundDeviceOutputProcessor()
             transcription_processor = _TranscriptionLoggingProcessor(self._notify_state)
-            state_processor = _AgentStateProcessor(self._notify_state)
+            state_processor = _AgentStateProcessor(
+                self._notify_state, session_llm_settings.llm_provider
+            )
             try:
                 pipeline = Pipeline(
                     [
@@ -1174,12 +1319,20 @@ class LocalPipecatDataSource:
                     self._pipeline_worker = None
                     self._notify_state(AgentState.IDLE)
 
-    async def _resolve_lm_studio_model(self) -> str:
-        configured_model = self._settings.lm_studio_model
+    async def _resolve_llm_model(
+        self, settings: LocalPipecatSettings | None = None
+    ) -> str:
+        settings = settings or self._settings
+        configured_model = settings.llm_model
         if configured_model:
             return configured_model
 
-        endpoint = f"{self._settings.lm_studio_base_url.rstrip('/')}/models"
+        if settings.llm_provider != "lm_studio":
+            raise RuntimeError(
+                "A model must be configured for this provider in [llm]."
+            )
+
+        endpoint = f"{settings.llm_base_url.rstrip('/')}/models"
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(endpoint)
             response.raise_for_status()
@@ -1188,8 +1341,8 @@ class LocalPipecatDataSource:
         models = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(models, list):
             raise RuntimeError(
-                "LM Studio returned an invalid /v1/models response; "
-                "set LM_STUDIO_MODEL to select a loaded model."
+                "The local provider returned an invalid /v1/models response; "
+                "set model in [llm] to select a loaded model."
             )
         for model in models:
             if isinstance(model, dict) and isinstance(model.get("id"), str):
@@ -1198,8 +1351,22 @@ class LocalPipecatDataSource:
                     return model_id
 
         raise RuntimeError(
-            "No model is loaded in LM Studio. Load a model or set LM_STUDIO_MODEL."
+            "No model is loaded in LM Studio. Load a model or set model in [llm]."
         )
+
+    def _resolve_llm_api_key(
+        self, settings: LocalPipecatSettings | None = None
+    ) -> str:
+        settings = settings or self._settings
+        if settings.llm_provider == "lm_studio":
+            return "lm-studio"
+        api_key = settings.llm_api_key
+        if not api_key:
+            raise ValueError(
+                f"Configure api_key for provider '{settings.llm_provider}' "
+                "in config.toml."
+            )
+        return api_key
 
     async def _clear_finished_session(self) -> None:
         runner_task = self._runner_task

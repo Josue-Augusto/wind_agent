@@ -1,10 +1,24 @@
-[lm_studio]
+[llm]
+selected_provider = "lm_studio"
+
+[llm.providers.lm_studio]
+base_url = "http://localhost:1234/v1"
 model = "openai/gpt-oss-20b"
 
+[llm.providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+model = ""
+api_key = ""
+
+[llm.providers.openai]
+base_url = "https://api.openai.com/v1"
+model = ""
+api_key = ""
+
 [conversation]
-language = "en"
-piper_voices = { pt = "pt_BR-cadu-medium", en = "en_US-amy-medium", es = "es_ES-davefx-medium" }
-voice = { speed = "normal", style = "natural", volume = "medium" }
+language = "pt"
+piper_voices = { pt = "pt_BR-edresson-low", en = "en_US-amy-medium", es = "es_ES-davefx-medium" }
+voice = { speed = "normal", style = "steady", volume = "medium" }
 
 [conversation.prompts]
 # Edite o texto do idioma usado e reinicie o aplicativo para aplicar.

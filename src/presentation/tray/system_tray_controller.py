@@ -30,7 +30,13 @@ class SystemTrayController:
         voice_volume_options: Sequence[tuple[str, str]],
         selected_voice_volume: str,
         on_select_voice_volume: Callable[[str], None],
+        llm_providers: Sequence[tuple[str, str]],
+        selected_llm_provider: str,
+        on_select_llm_provider: Callable[[str], None],
     ) -> None:
+        self._llm_providers = tuple(llm_providers)
+        self._selected_llm_provider = selected_llm_provider
+        self._on_select_llm_provider = on_select_llm_provider
         self._audio_input_devices = tuple(audio_input_devices)
         self._selected_audio_input_device = selected_audio_input_device
         self._on_select_audio_input_device = on_select_audio_input_device
@@ -67,6 +73,9 @@ class SystemTrayController:
     def _create_menu(self) -> pystray.Menu:
         return pystray.Menu(
             pystray.MenuItem("Iniciar/parar sessão", self._handle_toggle),
+            pystray.MenuItem(
+                "Provedor de IA (próxima sessão)", self._create_llm_provider_menu()
+            ),
             pystray.MenuItem(
                 "Microfone (próxima sessão)", self._create_audio_input_menu()
             ),
@@ -158,6 +167,33 @@ class SystemTrayController:
                 )
             )
         return pystray.Menu(*items)
+
+    def _create_llm_provider_menu(self) -> pystray.Menu:
+        def make_action(provider: str) -> Callable:
+            def select_provider(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+                self._on_select_llm_provider(provider)
+                self._selected_llm_provider = provider
+                icon.update_menu()
+
+            return select_provider
+
+        if not self._llm_providers:
+            return pystray.Menu(
+                pystray.MenuItem("Nenhum provedor configurado", None, enabled=False)
+            )
+        return pystray.Menu(
+            *(
+                pystray.MenuItem(
+                    label,
+                    make_action(provider),
+                    checked=lambda item, name=provider: (
+                        name == self._selected_llm_provider
+                    ),
+                    radio=True,
+                )
+                for provider, label in self._llm_providers
+            )
+        )
 
     def _create_conversation_language_menu(self) -> pystray.Menu:
         def make_action(language: str) -> Callable:

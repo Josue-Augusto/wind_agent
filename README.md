@@ -1,14 +1,15 @@
 # Assistente de voz local para Windows
 
-Assistente de voz executado localmente, com Pipecat, Whisper via CUDA, LM Studio
-e Piper TTS em português brasileiro. O atalho global `Shift+Espaço` e o menu da
-bandeja alternam a sessão de voz.
+Assistente de voz executado localmente, com Pipecat, Whisper via CUDA, provedores
+de LLM compatíveis com a API OpenAI e Piper TTS em português brasileiro. O atalho
+global `Shift+Espaço` e o menu da bandeja alternam a sessão de voz.
 
 ## Requisitos
 
 - Windows 11
 - Python 3.13
-- LM Studio com o servidor local iniciado em `http://localhost:1234/v1`
+- Um provedor de LLM com API compatível com OpenAI (por exemplo, LM Studio,
+  OpenRouter ou OpenAI)
 - GPU NVIDIA com CUDA para Whisper (ou configure o Whisper para CPU)
 - Microfone e dispositivo de saída de áudio disponíveis no Windows
 
@@ -32,24 +33,55 @@ comando perguntar se deve substituir o ambiente, responda `n` para mantê-lo.
 Se respondeu `y`, o `uv` recriou apenas o ambiente virtual; instale novamente
 as dependências com o segundo comando acima.
 
-No LM Studio, carregue um modelo e inicie o servidor local. O ID do modelo é
-lido de `config.toml`, na raiz do projeto:
+Os perfis de provedor ficam em `[llm.providers]` no `config.toml`. O menu da
+bandeja mostra os perfis configurados; **Provedor de IA (próxima sessão)** salva
+a escolha em `selected_provider`. Cada sessão usa somente o perfil selecionado.
+Para LM Studio:
 
 ```toml
-[lm_studio]
+[llm]
+selected_provider = "lm_studio"
+
+[llm.providers.lm_studio]
+base_url = "http://localhost:1234/v1"
 model = "gemma4-12b-qat-uncensored-hauhaucs-balanced"
 ```
 
-Edite o valor de `model` para corresponder exatamente ao ID apresentado pelo
-servidor local do LM Studio. Não é necessário definir `LM_STUDIO_MODEL` no
-terminal. O arquivo é carregado ao iniciar o aplicativo; reinicie-o depois de
-alterar a configuração.
+Para manter LM Studio, OpenRouter e OpenAI disponíveis no menu ao mesmo tempo,
+adicione os perfis necessários. As chaves são configuradas por perfil no próprio
+arquivo, como solicitado:
+
+```toml
+[llm]
+selected_provider = "openrouter"
+
+[llm.providers.lm_studio]
+base_url = "http://localhost:1234/v1"
+model = "openai/gpt-oss-20b"
+
+[llm.providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+model = "openai/gpt-4o-mini"
+api_key = "SUA_CHAVE_OPENROUTER"
+
+[llm.providers.openai]
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+api_key = "SUA_CHAVE_OPENAI"
+```
+
+O menu apresenta somente os perfis definidos em `[llm.providers]`. Para usar
+outro serviço local ou remoto compatível com OpenAI Chat Completions, adicione
+uma tabela com o identificador desejado, `base_url`, `model` e `api_key` se o
+serviço exigir autenticação. As chaves ficam em texto claro no `config.toml`;
+mantenha esse arquivo privado. LM Studio pode omitir `model` para detectar o
+modelo carregado. Reinicie o app após editar ou adicionar perfis; a seleção feita
+no menu é salva imediatamente e vale na próxima sessão.
 
 Outras configurações opcionais podem ser definidas por variáveis de ambiente:
 
 | Variável | Padrão | Uso |
 |---|---|---|
-| `LM_STUDIO_BASE_URL` | `http://localhost:1234/v1` | URL local da API do LM Studio |
 | `WHISPER_MODEL` | `small` | Modelo Faster-Whisper |
 | `WHISPER_DEVICE` | `cuda` | Dispositivo Whisper; use `cpu` sem GPU compatível |
 | `WHISPER_COMPUTE_TYPE` | `float16` | Tipo de cálculo; use `int8` em CPU |
@@ -62,10 +94,11 @@ estiverem disponíveis, o app informa isso no log e não inicia uma sessão de v
 Para executar explicitamente em CPU, defina `WHISPER_DEVICE=cpu` e
 `WHISPER_COMPUTE_TYPE=int8`.
 
-O código valida que a URL do LM Studio aponta para `localhost`, `127.0.0.1` ou
-`::1`. Isso impede o envio das conversas para um endpoint remoto. Os modelos de
-Whisper e Piper podem precisar ser baixados na primeira execução; depois de
-armazenados em cache, a inferência ocorre localmente.
+LM Studio é validado para apontar a `localhost`, `127.0.0.1` ou `::1`. Ao
+selecionar um provedor remoto, transcrições e contexto da conversa são enviados
+ao serviço indicado na configuração. Os modelos de Whisper e Piper podem precisar
+ser baixados na primeira execução; depois de armazenados em cache, a inferência
+ocorre localmente.
 
 ## Execução
 
@@ -96,7 +129,7 @@ microfone que aceita a taxa de captura do Whisper, sem listar mapeadores do
 Windows nem repetir cada entrada por driver. Sem escolha salva, usa a entrada
 padrão do sistema.
 Ao iniciar uma sessão, o log `application.log` informa quando o microfone
-entrega áudio, quando o Whisper conclui uma transcrição e quando o LM Studio
+entrega áudio, quando o Whisper conclui uma transcrição e quando o provedor LLM
 começa a responder. Se não aparecer a mensagem de áudio do microfone, selecione
 o microfone correto como entrada padrão nas configurações de som do Windows.
 
