@@ -51,11 +51,13 @@ _LOGGER = logging.getLogger(__name__)
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _LLM_PROVIDER_LABELS = {
     "lm_studio": "LM Studio",
+    "ollama": "Ollama",
     "openrouter": "OpenRouter",
     "openai": "OpenAI",
 }
 _LLM_PROVIDER_URLS = {
     "lm_studio": "http://localhost:1234/v1",
+    "ollama": "http://localhost:11434/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "openai": "https://api.openai.com/v1",
 }
@@ -226,8 +228,8 @@ class LocalPipecatSettings:
         parsed_url = urlsplit(self.llm_base_url)
         if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
             raise ValueError("llm_base_url must be an absolute HTTP(S) URL.")
-        if self.llm_provider == "lm_studio" and parsed_url.hostname not in _LOCAL_HOSTS:
-            raise ValueError("LM Studio must use a localhost URL.")
+        if self.llm_provider in {"lm_studio", "ollama"} and parsed_url.hostname not in _LOCAL_HOSTS:
+            raise ValueError(f"{self.llm_provider} must use a localhost URL.")
         if self.audio_sample_rate <= 0:
             raise ValueError("audio_sample_rate must be greater than zero.")
         if self.audio_channels != 1:
@@ -1358,8 +1360,8 @@ class LocalPipecatDataSource:
         self, settings: LocalPipecatSettings | None = None
     ) -> str:
         settings = settings or self._settings
-        if settings.llm_provider == "lm_studio":
-            return "lm-studio"
+        if settings.llm_provider in {"lm_studio", "ollama"}:
+            return settings.llm_provider
         api_key = settings.llm_api_key
         if not api_key:
             raise ValueError(

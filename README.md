@@ -8,8 +8,8 @@ global `Shift+Espaço` e o menu da bandeja alternam a sessão de voz.
 
 - Windows 11
 - Python 3.13
-- Um provedor de LLM com API compatível com OpenAI (por exemplo, LM Studio,
-  OpenRouter ou OpenAI)
+- Um provedor de LLM com API compatível com OpenAI (LM Studio, Ollama,
+  OpenRouter, OpenAI ou outro compatível)
 - GPU NVIDIA com CUDA para Whisper (ou configure o Whisper para CPU)
 - Microfone e dispositivo de saída de áudio disponíveis no Windows
 
@@ -47,7 +47,7 @@ base_url = "http://localhost:1234/v1"
 model = "gemma4-12b-qat-uncensored-hauhaucs-balanced"
 ```
 
-Para manter LM Studio, OpenRouter e OpenAI disponíveis no menu ao mesmo tempo,
+Para manter LM Studio, Ollama, OpenRouter e OpenAI disponíveis no menu ao mesmo tempo,
 adicione os perfis necessários. As chaves são configuradas por perfil no próprio
 arquivo, como solicitado:
 
@@ -58,6 +58,10 @@ selected_provider = "openrouter"
 [llm.providers.lm_studio]
 base_url = "http://localhost:1234/v1"
 model = "openai/gpt-oss-20b"
+
+[llm.providers.ollama]
+base_url = "http://localhost:11434/v1"
+model = "qwen3:8b"
 
 [llm.providers.openrouter]
 base_url = "https://openrouter.ai/api/v1"
@@ -70,13 +74,16 @@ model = "gpt-4o-mini"
 api_key = "SUA_CHAVE_OPENAI"
 ```
 
-O menu apresenta somente os perfis definidos em `[llm.providers]`. Para usar
-outro serviço local ou remoto compatível com OpenAI Chat Completions, adicione
-uma tabela com o identificador desejado, `base_url`, `model` e `api_key` se o
-serviço exigir autenticação. As chaves ficam em texto claro no `config.toml`;
-mantenha esse arquivo privado. LM Studio pode omitir `model` para detectar o
-modelo carregado. Reinicie o app após editar ou adicionar perfis; a seleção feita
-no menu é salva imediatamente e vale na próxima sessão.
+O Ollama usa a API compatível com OpenAI em `http://localhost:11434/v1`. Inicie o
+Ollama e baixe o modelo escolhido antes de iniciar a sessão; configure em `model`
+o nome mostrado por `ollama list`. Ollama não precisa de `api_key`. O menu
+apresenta somente os perfis definidos em `[llm.providers]`. Para usar outro
+serviço local ou remoto compatível com OpenAI Chat Completions, adicione uma
+tabela com o identificador desejado, `base_url`, `model` e `api_key` se exigir
+autenticação. As chaves ficam em texto claro no `config.toml`; mantenha esse
+arquivo privado. LM Studio pode omitir `model` para detectar o modelo carregado.
+Reinicie o app após editar ou adicionar perfis; a seleção feita no menu é salva
+imediatamente e vale na próxima sessão.
 
 Outras configurações opcionais podem ser definidas por variáveis de ambiente:
 
@@ -94,11 +101,11 @@ estiverem disponíveis, o app informa isso no log e não inicia uma sessão de v
 Para executar explicitamente em CPU, defina `WHISPER_DEVICE=cpu` e
 `WHISPER_COMPUTE_TYPE=int8`.
 
-LM Studio é validado para apontar a `localhost`, `127.0.0.1` ou `::1`. Ao
-selecionar um provedor remoto, transcrições e contexto da conversa são enviados
-ao serviço indicado na configuração. Os modelos de Whisper e Piper podem precisar
-ser baixados na primeira execução; depois de armazenados em cache, a inferência
-ocorre localmente.
+LM Studio e Ollama são validados para apontar a `localhost`, `127.0.0.1` ou
+`::1`. Ao selecionar um provedor remoto, transcrições e contexto da conversa são
+enviados ao serviço indicado na configuração. Os modelos de Whisper e Piper podem
+precisar ser baixados na primeira execução; depois de armazenados em cache, a
+inferência ocorre localmente.
 
 ## Execução
 

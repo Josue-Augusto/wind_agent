@@ -1,9 +1,14 @@
 [llm]
-selected_provider = "lm_studio"
+selected_provider = "ollama"
 
 [llm.providers.lm_studio]
 base_url = "http://localhost:1234/v1"
 model = "openai/gpt-oss-20b"
+
+[llm.providers.ollama]
+base_url = "http://localhost:11434/v1"
+# Use o identificador mostrado por `ollama list`, por exemplo `qwen3:8b`.
+model = "qwen2.5-coder:7b"
 
 [llm.providers.openrouter]
 base_url = "https://openrouter.ai/api/v1"
