@@ -158,6 +158,10 @@ na próxima sessão; os modelos de voz podem ser baixados na primeira utilizaç�
 Em **Configuração da voz (próxima sessão)**, escolha velocidade lenta, normal
 ou rápida; estilo estável, natural ou expressivo; e volume suave, médio ou alto.
 O estilo ajusta a variação da síntese Piper, não controla diretamente o pitch.
+Com Kokoro selecionado, esse menu oferece velocidade de 0,5x a 2,0x em passos
+de 0,1x, pausas após frases e trechos, e a opção de remover silêncios. Voz e
+idioma são selecionados nos menus próprios; as opções de estilo e volume do
+Piper não se aplicam ao Kokoro.
 As três preferências também ficam em `[conversation].voice` no `config.toml`.
 
 Os prompts do sistema ficam em `[conversation.prompts]` no mesmo arquivo, com
@@ -168,9 +172,8 @@ Em **Voz TTS (próxima sessão)**, escolha Qwen3-TTS local, Kokoro-82M ou Piper.
 O Kokoro-82M sintetiza em fluxo e oferece vozes próprias para português do
 Brasil, inglês e espanhol; selecione-as em **Voz Kokoro (próxima sessão)**. Os
 arquivos do modelo e das vozes são baixados automaticamente no primeiro uso
-(cerca de 354 MB) e ficam em `%LOCALAPPDATA%\WindAgent\kokoro`. A velocidade
-escolhida também se aplica ao Kokoro; estilo e volume configurados são usados
-pelo Piper e pelo Qwen3.
+(cerca de 354 MB) e ficam em `%LOCALAPPDATA%\WindAgent\kokoro`. A configuração
+específica do Kokoro fica em `conversation.kokoro_voice` no `config.toml`.
 
 Qwen3-TTS usa
 a GPU NVIDIA quando `[tts.qwen3].device = "cuda"`; na primeira sessão baixa os

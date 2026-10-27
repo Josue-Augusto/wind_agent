@@ -143,6 +143,27 @@ _VOICE_VOLUMES = {
     "medium": ("Médio", 0.85),
     "high": ("Alto", 1.0),
 }
+_KOKORO_VOICE_DEFAULTS = {
+    "speed": "1.0",
+    "sentence_pause": "0.25",
+    "clause_pause": "0.1",
+    "trim": "true",
+}
+_KOKORO_VOICE_OPTIONS = {
+    "speed": tuple(
+        (f"{step / 10:.1f}", f"{step / 10:.1f}x".replace(".", ","))
+        for step in range(5, 21)
+    ),
+    "sentence_pause": tuple(
+        (value, f"{value.replace('.', ',')} s")
+        for value in ("0", "0.1", "0.25", "0.5", "0.75", "1.0")
+    ),
+    "clause_pause": tuple(
+        (value, f"{value.replace('.', ',')} s")
+        for value in ("0", "0.05", "0.1", "0.2", "0.3", "0.5")
+    ),
+    "trim": (("true", "Ativado"), ("false", "Desativado")),
+}
 _WHISPER_LANGUAGES = {"pt": "PT", "en": "EN", "es": "ES"}
 _CUDA_DLL_DIRECTORY_HANDLES: list[Any] = []
 
@@ -857,6 +878,16 @@ class LocalPipecatDataSource:
             self._selected_voices_by_engine["kokoro"][language] = (
                 selected if selected in voice_ids else voices[0][0]
             )
+        saved_kokoro_settings = conversation_settings.get("kokoro_voice", {})
+        if not isinstance(saved_kokoro_settings, dict):
+            saved_kokoro_settings = {}
+        self._kokoro_voice_settings = dict(_KOKORO_VOICE_DEFAULTS)
+        for key, value in saved_kokoro_settings.items():
+            if key not in _KOKORO_VOICE_OPTIONS:
+                continue
+            value = str(value).lower() if key == "trim" else str(value)
+            if value in {option for option, _ in _KOKORO_VOICE_OPTIONS[key]}:
+                self._kokoro_voice_settings[key] = value
         saved_voice = conversation_settings.get("voice", {})
         if not isinstance(saved_voice, dict):
             saved_voice = {}
@@ -1103,6 +1134,9 @@ class LocalPipecatDataSource:
             kokoro_voices = existing.get("kokoro_voices", {})
             if not isinstance(kokoro_voices, dict):
                 kokoro_voices = {}
+            kokoro_voice_settings = existing.get("kokoro_voice", {})
+            if not isinstance(kokoro_voice_settings, dict):
+                kokoro_voice_settings = {}
             voice_settings = existing.get("voice", {})
             if not isinstance(voice_settings, dict):
                 voice_settings = {}
@@ -1118,6 +1152,12 @@ class LocalPipecatDataSource:
                 + ", ".join(
                     f"{language} = {json.dumps(voice, ensure_ascii=False)}"
                     for language, voice in kokoro_voices.items()
+                )
+                + " }",
+                "kokoro_voice": "{ "
+                + ", ".join(
+                    f"{key} = {str(value).lower() if key == 'trim' else value}"
+                    for key, value in kokoro_voice_settings.items()
                 )
                 + " }",
                 "voice": "{ "
@@ -1360,6 +1400,32 @@ class LocalPipecatDataSource:
             "volume": self._voice_volume,
         }
 
+    def get_kokoro_voice_options(self) -> dict[str, list[tuple[str, str]]]:
+        return {
+            key: list(options) for key, options in _KOKORO_VOICE_OPTIONS.items()
+        }
+
+    def get_kokoro_voice_settings(self) -> dict[str, str]:
+        return dict(self._kokoro_voice_settings)
+
+    def select_kokoro_voice_setting(self, setting: str, value: str) -> None:
+        valid_values = {
+            option for option, _ in _KOKORO_VOICE_OPTIONS.get(setting, ())
+        }
+        if value not in valid_values:
+            raise ValueError(
+                f"Unsupported Kokoro voice setting: {setting}={value!r}."
+            )
+        self._kokoro_voice_settings[setting] = value
+        self._save_conversation_settings(
+            {
+                "language": self._conversation_language,
+                "piper_voices": self._selected_voices_by_engine["piper"],
+                "kokoro_voices": self._selected_voices_by_engine["kokoro"],
+                "kokoro_voice": self._kokoro_voice_settings,
+            }
+        )
+
     def _save_voice_adjustments(self) -> None:
         conversation = self._load_conversation_settings()
         self._save_conversation_settings(
@@ -1550,6 +1616,60 @@ class LocalPipecatDataSource:
                         "project requirements with `uv pip install --python "
                         ".venv\\Scripts\\python.exe -r requirements.txt`."
                     ) from error
+
+                class _ConfiguredKokoroTTSService(KokoroTTSService):
+                    def __init__(
+                        self,
+                        *,
+                        trim: bool,
+                        sentence_pause: float,
+                        clause_pause: float,
+                        **kwargs: Any,
+                    ) -> None:
+                        self._trim = trim
+                        self._sentence_pause = sentence_pause
+                        self._clause_pause = clause_pause
+                        super().__init__(**kwargs)
+
+                    @traced_tts
+                    async def run_tts(
+                        self, text: str, context_id: str
+                    ) -> AsyncGenerator[Frame, None]:
+                        import numpy as np
+
+                        try:
+                            await self.start_tts_usage_metrics(text)
+                            stream = self._kokoro.create_stream(
+                                text,
+                                voice=self._settings.voice,
+                                lang=self.language_to_service_language(
+                                    self._settings.language
+                                ),
+                                speed=self._settings.speed,
+                                trim=self._trim,
+                                sentence_pause=self._sentence_pause,
+                                clause_pause=self._clause_pause,
+                            )
+                            async for samples, sample_rate in stream:
+                                await self.stop_ttfb_metrics()
+                                audio = (samples * 32767).astype(np.int16).tobytes()
+                                audio = await self._resampler.resample(
+                                    audio, sample_rate, self.sample_rate
+                                )
+                                yield TTSAudioRawFrame(
+                                    audio=audio,
+                                    sample_rate=self.sample_rate,
+                                    num_channels=1,
+                                    context_id=context_id,
+                                )
+                        except Exception as error:
+                            _LOGGER.exception("Kokoro-82M speech synthesis failed.")
+                            yield ErrorFrame(
+                                error=f"Kokoro-82M speech synthesis failed: {error}"
+                            )
+                        finally:
+                            await self.stop_ttfb_metrics()
+
                 kokoro_languages = {
                     "pt": Language.PT_BR,
                     "en": Language.EN_US,
@@ -1562,9 +1682,14 @@ class LocalPipecatDataSource:
                     _ensure_kokoro_assets
                 )
                 tts = await asyncio.to_thread(
-                    KokoroTTSService,
+                    _ConfiguredKokoroTTSService,
                     model_path=model_path,
                     voices_path=voices_path,
+                    trim=self._kokoro_voice_settings["trim"] == "true",
+                    sentence_pause=float(
+                        self._kokoro_voice_settings["sentence_pause"]
+                    ),
+                    clause_pause=float(self._kokoro_voice_settings["clause_pause"]),
                     settings=KokoroTTSService.Settings(
                         model="kokoro-82m",
                         voice=self.get_selected_voice(),

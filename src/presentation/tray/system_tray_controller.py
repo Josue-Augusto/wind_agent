@@ -37,6 +37,9 @@ class SystemTrayController:
         selected_tts_engine: str,
         on_select_tts_engine: Callable[[str], None],
         on_add_qwen3_reference: Callable[[], None],
+        kokoro_voice_options: dict[str, Sequence[tuple[str, str]]],
+        kokoro_voice_settings: dict[str, str],
+        on_select_kokoro_voice_setting: Callable[[str, str], None],
     ) -> None:
         self._llm_providers = tuple(llm_providers)
         self._selected_llm_provider = selected_llm_provider
@@ -45,6 +48,11 @@ class SystemTrayController:
         self._selected_tts_engine = selected_tts_engine
         self._on_select_tts_engine = on_select_tts_engine
         self._on_add_qwen3_reference = on_add_qwen3_reference
+        self._kokoro_voice_options = {
+            name: tuple(options) for name, options in kokoro_voice_options.items()
+        }
+        self._kokoro_voice_settings = dict(kokoro_voice_settings)
+        self._on_select_kokoro_voice_setting = on_select_kokoro_voice_setting
         self._audio_input_devices = tuple(audio_input_devices)
         self._selected_audio_input_device = selected_audio_input_device
         self._on_select_audio_input_device = on_select_audio_input_device
@@ -105,17 +113,7 @@ class SystemTrayController:
             ),
             pystray.MenuItem(
                 "Configuração da voz (próxima sessão)",
-                pystray.Menu(
-                    pystray.MenuItem(
-                        "Velocidade", self._create_voice_speed_menu()
-                    ),
-                    pystray.MenuItem(
-                        "Estilo", self._create_voice_style_menu()
-                    ),
-                    pystray.MenuItem(
-                        "Volume", self._create_voice_volume_menu()
-                    ),
-                ),
+                self._create_voice_configuration_menu(),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Sair", self._handle_exit),
@@ -326,6 +324,51 @@ class SystemTrayController:
             self._voice_speed_options,
             "_selected_voice_speed",
             self._on_select_voice_speed,
+        )
+
+    def _create_voice_configuration_menu(self) -> pystray.Menu:
+        if self._selected_tts_engine == "kokoro":
+            labels = {
+                "speed": "Velocidade",
+                "sentence_pause": "Pausa entre frases",
+                "clause_pause": "Pausa entre trechos",
+                "trim": "Remover silêncios",
+            }
+            return pystray.Menu(
+                *(
+                    pystray.MenuItem(
+                        labels[setting], self._create_kokoro_setting_menu(setting)
+                    )
+                    for setting in labels
+                )
+            )
+        return pystray.Menu(
+            pystray.MenuItem("Velocidade", self._create_voice_speed_menu()),
+            pystray.MenuItem("Estilo", self._create_voice_style_menu()),
+            pystray.MenuItem("Volume", self._create_voice_volume_menu()),
+        )
+
+    def _create_kokoro_setting_menu(self, setting: str) -> pystray.Menu:
+        def make_action(value: str) -> Callable:
+            def select_option(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+                self._kokoro_voice_settings[setting] = value
+                self._on_select_kokoro_voice_setting(setting, value)
+                icon.update_menu()
+
+            return select_option
+
+        return pystray.Menu(
+            *(
+                pystray.MenuItem(
+                    label,
+                    make_action(value),
+                    checked=lambda item, option=value: (
+                        option == self._kokoro_voice_settings[setting]
+                    ),
+                    radio=True,
+                )
+                for value, label in self._kokoro_voice_options[setting]
+            )
         )
 
     def _create_voice_style_menu(self) -> pystray.Menu:

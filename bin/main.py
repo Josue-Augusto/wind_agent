@@ -246,6 +246,25 @@ async def _run_application() -> None:
         except RuntimeError as error:
             _LOGGER.warning("Could not schedule TTS engine selection: %s", error)
 
+    def _select_kokoro_voice_setting(setting: str, value: str) -> None:
+        try:
+            datasource.select_kokoro_voice_setting(setting, value)
+            _LOGGER.info(
+                "Kokoro voice setting %s set to %s for future sessions.",
+                setting,
+                value,
+            )
+        except (OSError, ValueError) as error:
+            _LOGGER.error("Could not set Kokoro voice setting %s: %s", setting, error)
+
+    def _schedule_kokoro_voice_setting(setting: str, value: str) -> None:
+        try:
+            loop.call_soon_threadsafe(
+                _select_kokoro_voice_setting, setting, value
+            )
+        except RuntimeError as error:
+            _LOGGER.warning("Could not schedule Kokoro voice setting: %s", error)
+
     async def _add_qwen3_reference() -> None:
         try:
             reference_path = await asyncio.to_thread(_choose_qwen3_reference_file)
@@ -293,6 +312,9 @@ async def _run_application() -> None:
         datasource.get_selected_tts_engine(),
         _schedule_tts_engine_selection,
         _schedule_add_qwen3_reference,
+        datasource.get_kokoro_voice_options(),
+        datasource.get_kokoro_voice_settings(),
+        _schedule_kokoro_voice_setting,
     )
     hotkey = HotkeyListener(_schedule_toggle_session)
     tray.set_agent_state(repository.get_state().value)
