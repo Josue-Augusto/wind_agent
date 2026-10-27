@@ -27,6 +27,7 @@ from pipecat.frames.frames import (
     Frame,
     ErrorFrame,
     InputAudioRawFrame,
+    InterruptionFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     StartFrame,
@@ -545,6 +546,8 @@ class _SoundDeviceOutputProcessor(FrameProcessor):
         self._stream_format: tuple[int, int] | None = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        if isinstance(frame, InterruptionFrame):
+            self._abort_audio()
         await super().process_frame(frame, direction)
         if direction is FrameDirection.DOWNSTREAM and isinstance(
             frame, TTSAudioRawFrame
@@ -565,6 +568,21 @@ class _SoundDeviceOutputProcessor(FrameProcessor):
             self._stream_format = audio_format
 
         self._stream.write(frame.audio)
+
+    def _abort_audio(self) -> None:
+        """Discard queued playback immediately when the user starts speaking."""
+        stream, self._stream = self._stream, None
+        self._stream_format = None
+        if stream is None:
+            return
+        try:
+            stream.abort()
+        except Exception:
+            _LOGGER.debug("Could not abort interrupted audio playback.", exc_info=True)
+        try:
+            stream.close()
+        except Exception:
+            _LOGGER.debug("Could not close interrupted audio playback.", exc_info=True)
 
     async def cleanup(self) -> None:
         try:
