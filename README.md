@@ -1,7 +1,8 @@
 # Assistente de voz local para Windows
 
 Assistente de voz executado localmente, com Pipecat, Whisper via CUDA, provedores
-de LLM compatíveis com a API OpenAI e Qwen3-TTS ou Piper TTS. O atalho
+de LLM compatíveis com a API OpenAI e os mecanismos Qwen3-TTS, Kokoro-82M ou
+Piper TTS. O atalho
 global `Shift+Espaço` e o menu da bandeja alternam a sessão de voz.
 
 ## Requisitos
@@ -147,12 +148,12 @@ o microfone correto como entrada padrão nas configurações de som do Windows.
 No menu da bandeja, use **Idioma da conversa (próxima sessão)** para escolher
 português do Brasil, inglês dos Estados Unidos ou espanhol. O idioma selecionado
 configura a transcrição do Whisper e o idioma de resposta do assistente. O menu
-**Voz (próxima sessão)** mostra somente vozes Piper disponíveis para esse idioma.
-Idioma e vozes selecionadas ficam salvos na seção `[conversation]` de
+**Voz [mecanismo] (próxima sessão)** mostra as vozes disponíveis para o idioma
+selecionado e para o mecanismo ativo. Idioma e vozes selecionadas ficam salvos
+na seção `[conversation]` de
 `config.toml`; a seleção de microfone continua em
 `%LOCALAPPDATA%\WindAgent\settings.json`. As escolhas de conversa passam a valer
-na próxima sessão; os modelos de voz podem ser baixados pelo Piper na primeira
-utilização.
+na próxima sessão; os modelos de voz podem ser baixados na primeira utilização.
 
 Em **Configuração da voz (próxima sessão)**, escolha velocidade lenta, normal
 ou rápida; estilo estável, natural ou expressivo; e volume suave, médio ou alto.
@@ -163,7 +164,15 @@ Os prompts do sistema ficam em `[conversation.prompts]` no mesmo arquivo, com
 uma chave para cada idioma (`pt`, `en` e `es`). Edite o texto da chave do idioma
 que usa e reinicie o aplicativo para carregar o prompt personalizado.
 
-Em **Voz TTS (próxima sessão)**, escolha Qwen3-TTS local ou Piper. Qwen3-TTS usa
+Em **Voz TTS (próxima sessão)**, escolha Qwen3-TTS local, Kokoro-82M ou Piper.
+O Kokoro-82M sintetiza em fluxo e oferece vozes próprias para português do
+Brasil, inglês e espanhol; selecione-as em **Voz Kokoro (próxima sessão)**. Os
+arquivos do modelo e das vozes são baixados automaticamente no primeiro uso
+(cerca de 354 MB) e ficam em `%LOCALAPPDATA%\WindAgent\kokoro`. A velocidade
+escolhida também se aplica ao Kokoro; estilo e volume configurados são usados
+pelo Piper e pelo Qwen3.
+
+Qwen3-TTS usa
 a GPU NVIDIA quando `[tts.qwen3].device = "cuda"`; na primeira sessão baixa os
 pesos do modelo Base 0.6B. Para usar clonagem de voz, indique um WAV em
 `[tts.qwen3].reference_audio` e a transcrição correspondente em

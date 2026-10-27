@@ -166,9 +166,9 @@ async def _run_application() -> None:
     def _select_voice(voice: str) -> None:
         try:
             datasource.select_voice(voice)
-            _LOGGER.info("Piper voice %s selected for future sessions.", voice)
+            _LOGGER.info("TTS voice %s selected for future sessions.", voice)
         except ValueError as error:
-            _LOGGER.error("Could not select Piper voice %s: %s", voice, error)
+            _LOGGER.error("Could not select TTS voice %s: %s", voice, error)
 
     def _schedule_voice_selection(voice: str) -> None:
         try:
@@ -231,6 +231,11 @@ async def _run_application() -> None:
     def _select_tts_engine(engine: str) -> None:
         try:
             datasource.select_tts_engine(engine)
+            if tray is not None:
+                tray.update_voice_options(
+                    datasource.get_voices_by_language(),
+                    datasource.get_selected_voices_by_language(),
+                )
             _LOGGER.info("TTS engine %s selected for future sessions.", engine)
         except (OSError, ValueError) as error:
             _LOGGER.error("Could not select TTS engine %s: %s", engine, error)

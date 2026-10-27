@@ -67,6 +67,7 @@ _LLM_PROVIDER_URLS = {
 }
 _TTS_ENGINES = {
     "qwen3": "Qwen3-TTS local",
+    "kokoro": "Kokoro-82M",
     "piper": "Piper",
 }
 _QWEN3_SPEED = {"slow": 0.88, "normal": 1.0, "fast": 1.12}
@@ -75,6 +76,19 @@ _CONFIG_FILE = Path(__file__).resolve().parents[3] / "config.toml"
 _USER_SETTINGS_FILE = Path(
     os.getenv("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
 ) / "WindAgent" / "settings.json"
+_KOKORO_MODEL_DIRECTORY = Path(
+    os.getenv("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+) / "WindAgent" / "kokoro"
+_KOKORO_ASSETS = {
+    "kokoro-v1.0.onnx": (
+        "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+        "model-files-v1.1/kokoro-v1.0.onnx"
+    ),
+    "voices-v1.0.bin": (
+        "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+        "model-files-v1.1/voices-v1.0.bin"
+    ),
+}
 _CONVERSATION_LANGUAGES = {
     "pt": ("Português (Brasil)", "pt_BR-faber-medium"),
     "en": ("English (US)", "en_US-lessac-medium"),
@@ -95,6 +109,23 @@ _PIPER_VOICES = {
         ("es_ES-davefx-medium", "Davefx (média)"),
         ("es_MX-ald-medium", "Ald (média, México)"),
     ),
+}
+_KOKORO_VOICES = {
+    "pt": (("pf_dora", "Dora"), ("pm_alex", "Alex"), ("pm_santa", "Papai Noel")),
+    "en": (
+        ("af_alloy", "Alloy"), ("af_aoede", "Aoede"), ("af_bella", "Bella"),
+        ("af_heart", "Heart"), ("af_jessica", "Jessica"), ("af_kore", "Kore"),
+        ("af_nicole", "Nicole"), ("af_nova", "Nova"), ("af_river", "River"),
+        ("af_sarah", "Sarah"), ("af_sky", "Sky"), ("am_adam", "Adam"),
+        ("am_echo", "Echo"), ("am_eric", "Eric"), ("am_fenrir", "Fenrir"),
+        ("am_liam", "Liam"), ("am_michael", "Michael"), ("am_onyx", "Onyx"),
+        ("am_puck", "Puck"), ("am_santa", "Santa Claus"), ("bf_alice", "Alice (britânica)"),
+        ("bf_emma", "Emma (britânica)"), ("bf_isabella", "Isabella (britânica)"),
+        ("bf_lily", "Lily (britânica)"), ("bm_daniel", "Daniel (britânica)"),
+        ("bm_fable", "Fable (britânica)"), ("bm_george", "George (britânica)"),
+        ("bm_lewis", "Lewis (britânica)"),
+    ),
+    "es": (("ef_dora", "Dora"), ("em_alex", "Alex"), ("em_santa", "Papai Noel")),
 }
 _VOICE_SPEEDS = {
     "slow": ("Lenta", 1.2),
@@ -182,7 +213,7 @@ def _load_tts_config() -> dict[str, Any]:
         raise ValueError("[tts] must be a TOML table in config.toml.")
     engine = tts_config.get("engine", "piper")
     if not isinstance(engine, str) or engine not in _TTS_ENGINES:
-        raise ValueError("[tts].engine must be 'qwen3' or 'piper'.")
+        raise ValueError("[tts].engine must be 'qwen3', 'kokoro' or 'piper'.")
     return {
         "engine": engine,
         "qwen3": _load_qwen3_tts_config(tts_config),
@@ -253,6 +284,26 @@ def _configure_cuda_runtime(device: str) -> None:
             "could not be loaded. Install the NVIDIA runtime dependencies from "
             "requirements-cuda.txt and restart the application."
         ) from error
+
+
+def _ensure_kokoro_assets() -> tuple[str, str]:
+    _KOKORO_MODEL_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for filename, url in _KOKORO_ASSETS.items():
+        path = _KOKORO_MODEL_DIRECTORY / filename
+        if not path.is_file():
+            temporary_path = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+            _LOGGER.info("Downloading Kokoro asset %s.", filename)
+            with httpx.stream(
+                "GET", url, timeout=300.0, follow_redirects=True
+            ) as response:
+                response.raise_for_status()
+                with temporary_path.open("wb") as asset_file:
+                    for chunk in response.iter_bytes():
+                        asset_file.write(chunk)
+            temporary_path.replace(path)
+        paths.append(str(path))
+    return paths[0], paths[1]
 
 
 def _qwen3_voice_prompt_cache_path(
@@ -748,7 +799,7 @@ class LocalPipecatDataSource:
         saved_voices = conversation_settings.get("piper_voices", {})
         if not isinstance(saved_voices, dict):
             saved_voices = {}
-        self._voices_by_language = {
+        self._piper_voices_by_language = {
             language: list(voices) for language, voices in _PIPER_VOICES.items()
         }
         configured_voice = self._settings.piper_voice
@@ -757,19 +808,19 @@ class LocalPipecatDataSource:
             "en": "en_US-",
             "es": ("es_ES-", "es_MX-"),
         }
-        for language in self._voices_by_language:
+        for language in self._piper_voices_by_language:
             configured_voice_matches_language = configured_voice.startswith(
                 voice_prefixes[language]
             )
             configured_voice_is_listed = configured_voice in {
-                voice for voice, _ in self._voices_by_language[language]
+                voice for voice, _ in self._piper_voices_by_language[language]
             }
             if configured_voice_matches_language and not configured_voice_is_listed:
-                self._voices_by_language[language].append(
+                self._piper_voices_by_language[language].append(
                     (configured_voice, configured_voice)
                 )
-        self._selected_voices_by_language = {}
-        for language, voices in self._voices_by_language.items():
+        self._selected_voices_by_engine = {"piper": {}, "kokoro": {}}
+        for language, voices in self._piper_voices_by_language.items():
             voice_ids = {voice for voice, _ in voices}
             selected = saved_voices.get(language)
             if selected not in voice_ids:
@@ -778,7 +829,16 @@ class LocalPipecatDataSource:
                     if self._settings.piper_voice in voice_ids
                     else _CONVERSATION_LANGUAGES[language][1]
                 )
-            self._selected_voices_by_language[language] = selected
+            self._selected_voices_by_engine["piper"][language] = selected
+        saved_kokoro_voices = conversation_settings.get("kokoro_voices", {})
+        if not isinstance(saved_kokoro_voices, dict):
+            saved_kokoro_voices = {}
+        for language, voices in _KOKORO_VOICES.items():
+            voice_ids = {voice for voice, _ in voices}
+            selected = saved_kokoro_voices.get(language)
+            self._selected_voices_by_engine["kokoro"][language] = (
+                selected if selected in voice_ids else voices[0][0]
+            )
         saved_voice = conversation_settings.get("voice", {})
         if not isinstance(saved_voice, dict):
             saved_voice = {}
@@ -1022,6 +1082,9 @@ class LocalPipecatDataSource:
             selected_voices = existing.get("piper_voices", {})
             if not isinstance(selected_voices, dict):
                 selected_voices = {}
+            kokoro_voices = existing.get("kokoro_voices", {})
+            if not isinstance(kokoro_voices, dict):
+                kokoro_voices = {}
             voice_settings = existing.get("voice", {})
             if not isinstance(voice_settings, dict):
                 voice_settings = {}
@@ -1031,6 +1094,12 @@ class LocalPipecatDataSource:
                 + ", ".join(
                     f"{language} = {json.dumps(voice, ensure_ascii=False)}"
                     for language, voice in selected_voices.items()
+                )
+                + " }",
+                "kokoro_voices": "{ "
+                + ", ".join(
+                    f"{language} = {json.dumps(voice, ensure_ascii=False)}"
+                    for language, voice in kokoro_voices.items()
                 )
                 + " }",
                 "voice": "{ "
@@ -1233,17 +1302,29 @@ class LocalPipecatDataSource:
     def get_selected_conversation_language(self) -> str:
         return self._conversation_language
 
-    def get_voices_by_language(self) -> dict[str, list[tuple[str, str]]]:
+    def get_voices_by_language(
+        self, engine: str | None = None
+    ) -> dict[str, list[tuple[str, str]]]:
+        selected_engine = engine or self._tts_engine
+        voices_by_language = (
+            _KOKORO_VOICES
+            if selected_engine == "kokoro"
+            else self._piper_voices_by_language
+        )
         return {
             language: list(voices)
-            for language, voices in self._voices_by_language.items()
+            for language, voices in voices_by_language.items()
         }
 
     def get_selected_voice(self) -> str:
-        return self._selected_voices_by_language[self._conversation_language]
+        engine = self._voice_engine_key()
+        return self._selected_voices_by_engine[engine][self._conversation_language]
 
     def get_selected_voices_by_language(self) -> dict[str, str]:
-        return dict(self._selected_voices_by_language)
+        return dict(self._selected_voices_by_engine[self._voice_engine_key()])
+
+    def _voice_engine_key(self) -> str:
+        return "kokoro" if self._tts_engine == "kokoro" else "piper"
 
     def get_voice_speed_options(self) -> list[tuple[str, str]]:
         return [(key, value[0]) for key, value in _VOICE_SPEEDS.items()]
@@ -1266,7 +1347,8 @@ class LocalPipecatDataSource:
         self._save_conversation_settings(
             {
                 "language": self._conversation_language,
-                "piper_voices": self._selected_voices_by_language,
+                "piper_voices": self._selected_voices_by_engine["piper"],
+                "kokoro_voices": self._selected_voices_by_engine["kokoro"],
                 "voice": {
                     **(
                         conversation.get("voice", {})
@@ -1305,25 +1387,33 @@ class LocalPipecatDataSource:
         self._save_conversation_settings(
             {
                 "language": language,
-                "piper_voices": self._selected_voices_by_language,
+                "piper_voices": self._selected_voices_by_engine["piper"],
+                "kokoro_voices": self._selected_voices_by_engine["kokoro"],
             }
         )
 
     def select_voice(self, voice: str) -> None:
+        engine = self._voice_engine_key()
+        voices_by_language = (
+            _KOKORO_VOICES
+            if engine == "kokoro"
+            else self._piper_voices_by_language
+        )
         available_voices = {
             voice_id
-            for voice_id, _ in self._voices_by_language[self._conversation_language]
+            for voice_id, _ in voices_by_language[self._conversation_language]
         }
         if voice not in available_voices:
             raise ValueError(
                 f"Voice {voice!r} is not available for language "
                 f"{self._conversation_language!r}."
             )
-        self._selected_voices_by_language[self._conversation_language] = voice
+        self._selected_voices_by_engine[engine][self._conversation_language] = voice
         self._save_conversation_settings(
             {
                 "language": self._conversation_language,
-                "piper_voices": self._selected_voices_by_language,
+                "piper_voices": self._selected_voices_by_engine["piper"],
+                "kokoro_voices": self._selected_voices_by_engine["kokoro"],
             }
         )
 
@@ -1432,6 +1522,38 @@ class LocalPipecatDataSource:
                         noise_w_scale=_VOICE_STYLES[self._voice_style][2],
                         volume=_VOICE_VOLUMES[self._voice_volume][1],
                     ),
+                )
+            elif self._tts_engine == "kokoro":
+                try:
+                    from pipecat.services.kokoro.tts import KokoroTTSService
+                except ImportError as error:
+                    raise RuntimeError(
+                        "Kokoro dependencies are missing. Install the updated "
+                        "project requirements with `uv pip install --python "
+                        ".venv\\Scripts\\python.exe -r requirements.txt`."
+                    ) from error
+                kokoro_languages = {
+                    "pt": Language.PT_BR,
+                    "en": Language.EN_US,
+                    "es": Language.ES,
+                }
+                _LOGGER.info(
+                    "Loading Kokoro-82M model and voice assets on first use."
+                )
+                model_path, voices_path = await asyncio.to_thread(
+                    _ensure_kokoro_assets
+                )
+                tts = await asyncio.to_thread(
+                    KokoroTTSService,
+                    model_path=model_path,
+                    voices_path=voices_path,
+                    settings=KokoroTTSService.Settings(
+                        model="kokoro-82m",
+                        voice=self.get_selected_voice(),
+                        language=kokoro_languages[self._conversation_language],
+                        speed=_QWEN3_SPEED[self._voice_speed],
+                    ),
+                    sample_rate=24_000,
                 )
             elif self._tts_engine == "qwen3":
                 if not self._qwen3_reference_audio or not Path(

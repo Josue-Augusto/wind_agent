@@ -82,7 +82,7 @@ class SystemTrayController:
         voice_menu_label = (
             "Voz de referência Qwen3-TTS"
             if self._selected_tts_engine == "qwen3"
-            else "Voz Piper (próxima sessão)"
+            else f"Voz {self._selected_tts_engine.title()} (próxima sessão)"
         )
         return pystray.Menu(
             pystray.MenuItem("Iniciar/parar sessão", self._handle_toggle),
@@ -232,6 +232,23 @@ class SystemTrayController:
                 for engine, label in self._tts_engines
             )
         )
+
+    def update_voice_options(
+        self,
+        voices_by_language: dict[str, Sequence[tuple[str, str]]],
+        selected_voices_by_language: dict[str, str],
+    ) -> None:
+        with self._lock:
+            self._voices_by_language = {
+                language: tuple(voices)
+                for language, voices in voices_by_language.items()
+            }
+            self._selected_voices_by_language = dict(selected_voices_by_language)
+            self._selected_voice = self._selected_voices_by_language.get(
+                self._selected_conversation_language, self._selected_voice
+            )
+            self._icon.menu = self._create_menu()
+            self._icon.update_menu()
 
     def _create_conversation_language_menu(self) -> pystray.Menu:
         def make_action(language: str) -> Callable:
