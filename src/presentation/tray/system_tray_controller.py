@@ -33,10 +33,18 @@ class SystemTrayController:
         llm_providers: Sequence[tuple[str, str]],
         selected_llm_provider: str,
         on_select_llm_provider: Callable[[str], None],
+        tts_engines: Sequence[tuple[str, str]],
+        selected_tts_engine: str,
+        on_select_tts_engine: Callable[[str], None],
+        on_add_qwen3_reference: Callable[[], None],
     ) -> None:
         self._llm_providers = tuple(llm_providers)
         self._selected_llm_provider = selected_llm_provider
         self._on_select_llm_provider = on_select_llm_provider
+        self._tts_engines = tuple(tts_engines)
+        self._selected_tts_engine = selected_tts_engine
+        self._on_select_tts_engine = on_select_tts_engine
+        self._on_add_qwen3_reference = on_add_qwen3_reference
         self._audio_input_devices = tuple(audio_input_devices)
         self._selected_audio_input_device = selected_audio_input_device
         self._on_select_audio_input_device = on_select_audio_input_device
@@ -71,10 +79,18 @@ class SystemTrayController:
         self._started = False
 
     def _create_menu(self) -> pystray.Menu:
+        voice_menu_label = (
+            "Voz de referência Qwen3-TTS"
+            if self._selected_tts_engine == "qwen3"
+            else "Voz Piper (próxima sessão)"
+        )
         return pystray.Menu(
             pystray.MenuItem("Iniciar/parar sessão", self._handle_toggle),
             pystray.MenuItem(
                 "Provedor de IA (próxima sessão)", self._create_llm_provider_menu()
+            ),
+            pystray.MenuItem(
+                "Voz TTS (próxima sessão)", self._create_tts_engine_menu()
             ),
             pystray.MenuItem(
                 "Microfone (próxima sessão)", self._create_audio_input_menu()
@@ -84,7 +100,7 @@ class SystemTrayController:
                 self._create_conversation_language_menu(),
             ),
             pystray.MenuItem(
-                "Voz (próxima sessão)",
+                voice_menu_label,
                 self._create_voice_menu(),
             ),
             pystray.MenuItem(
@@ -195,6 +211,28 @@ class SystemTrayController:
             )
         )
 
+    def _create_tts_engine_menu(self) -> pystray.Menu:
+        def make_action(engine: str) -> Callable:
+            def select_engine(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+                self._on_select_tts_engine(engine)
+                self._selected_tts_engine = engine
+                icon.menu = self._create_menu()
+                icon.update_menu()
+
+            return select_engine
+
+        return pystray.Menu(
+            *(
+                pystray.MenuItem(
+                    label,
+                    make_action(engine),
+                    checked=lambda item, name=engine: name == self._selected_tts_engine,
+                    radio=True,
+                )
+                for engine, label in self._tts_engines
+            )
+        )
+
     def _create_conversation_language_menu(self) -> pystray.Menu:
         def make_action(language: str) -> Callable:
             def select_language(icon: pystray.Icon, item: pystray.MenuItem) -> None:
@@ -225,6 +263,13 @@ class SystemTrayController:
         )
 
     def _create_voice_menu(self) -> pystray.Menu:
+        if self._selected_tts_engine == "qwen3":
+            return pystray.Menu(
+                pystray.MenuItem(
+                    "Selecionar arquivo WAV...", self._handle_add_qwen3_reference
+                )
+            )
+
         voices = self._voices_by_language.get(
             self._selected_conversation_language, ()
         )
@@ -253,6 +298,11 @@ class SystemTrayController:
                 for voice, label in voices
             )
         )
+
+    def _handle_add_qwen3_reference(
+        self, icon: pystray.Icon, item: pystray.MenuItem
+    ) -> None:
+        self._on_add_qwen3_reference()
 
     def _create_voice_speed_menu(self) -> pystray.Menu:
         return self._create_voice_option_menu(

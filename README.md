@@ -1,7 +1,7 @@
 # Assistente de voz local para Windows
 
 Assistente de voz executado localmente, com Pipecat, Whisper via CUDA, provedores
-de LLM compatíveis com a API OpenAI e Piper TTS em português brasileiro. O atalho
+de LLM compatíveis com a API OpenAI e Qwen3-TTS ou Piper TTS. O atalho
 global `Shift+Espaço` e o menu da bandeja alternam a sessão de voz.
 
 ## Requisitos
@@ -22,16 +22,20 @@ e instale as dependências:
 if (-not (Test-Path ".venv\Scripts\python.exe")) { uv venv --python 3.13 }
 uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 uv pip install --python .venv\Scripts\python.exe -r requirements-cuda.txt
+uv pip install --python .venv\Scripts\python.exe --index-url https://download.pytorch.org/whl/cu128 torch==2.7.0 torchaudio==2.7.0
+uv pip install --python .venv\Scripts\python.exe -r requirements-qwen3.txt
 ```
 
 `requirements-cuda.txt` instala as bibliotecas CUDA 12 e cuDNN 9 usadas pelo
 Faster-Whisper na GPU NVIDIA. Elas ficam no ambiente virtual do projeto; o app
 adiciona os diretórios dessas DLLs ao caminho de busca ao iniciar uma sessão.
+Os comandos seguintes instalam PyTorch com CUDA 12.8 para a GPU NVIDIA RTX 50,
+o Qwen3-TTS e suas dependências.
 
 Se `.venv` já existir, não é necessário executar `uv venv` novamente. Se o
 comando perguntar se deve substituir o ambiente, responda `n` para mantê-lo.
 Se respondeu `y`, o `uv` recriou apenas o ambiente virtual; instale novamente
-as dependências com o segundo comando acima.
+as dependências repetindo os comandos de instalação acima.
 
 Os perfis de provedor ficam em `[llm.providers]` no `config.toml`. O menu da
 bandeja mostra os perfis configurados; **Provedor de IA (próxima sessão)** salva
@@ -158,6 +162,15 @@ As três preferências também ficam em `[conversation].voice` no `config.toml`.
 Os prompts do sistema ficam em `[conversation.prompts]` no mesmo arquivo, com
 uma chave para cada idioma (`pt`, `en` e `es`). Edite o texto da chave do idioma
 que usa e reinicie o aplicativo para carregar o prompt personalizado.
+
+Em **Voz TTS (próxima sessão)**, escolha Qwen3-TTS local ou Piper. Qwen3-TTS usa
+a GPU NVIDIA quando `[tts.qwen3].device = "cuda"`; na primeira sessão baixa os
+pesos do modelo Base 0.6B. Para usar clonagem de voz, indique um WAV em
+`[tts.qwen3].reference_audio` e a transcrição correspondente em
+`[tts.qwen3].reference_text`. Também é possível trocar o WAV no menu da bandeja
+**Voz de referência Qwen3-TTS**. O prompt de voz processado é armazenado em
+`%LOCALAPPDATA%\WindAgent\qwen3\voice_prompts` e reutilizado entre sessões.
+Piper permanece disponível com vozes separadas por idioma.
 
 > **Distribuição:** a integração Piper em processo usa `piper-tts`, licenciado
 > sob GPL-3.0. Avalie as obrigações da licença antes de redistribuir o

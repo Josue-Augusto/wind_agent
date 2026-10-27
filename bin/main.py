@@ -18,6 +18,24 @@ from src.presentation.tray.system_tray_controller import SystemTrayController
 _LOGGER = logging.getLogger(__name__)
 
 
+def _choose_qwen3_reference_file() -> str | None:
+    import tkinter as tk
+    from tkinter import filedialog
+
+    window = tk.Tk()
+    window.withdraw()
+    window.attributes("-topmost", True)
+    try:
+        selected = filedialog.askopenfilename(
+            parent=window,
+            title="Selecione uma gravação WAV para a voz do Qwen3-TTS",
+            filetypes=[("Áudio WAV", "*.wav"), ("Todos os arquivos", "*.*")],
+        )
+    finally:
+        window.destroy()
+    return selected or None
+
+
 def _configure_logging() -> None:
     local_app_data = Path(
         os.getenv("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
@@ -210,6 +228,37 @@ async def _run_application() -> None:
         except RuntimeError as error:
             _LOGGER.warning("Could not schedule LLM provider selection: %s", error)
 
+    def _select_tts_engine(engine: str) -> None:
+        try:
+            datasource.select_tts_engine(engine)
+            _LOGGER.info("TTS engine %s selected for future sessions.", engine)
+        except (OSError, ValueError) as error:
+            _LOGGER.error("Could not select TTS engine %s: %s", engine, error)
+
+    def _schedule_tts_engine_selection(engine: str) -> None:
+        try:
+            loop.call_soon_threadsafe(_select_tts_engine, engine)
+        except RuntimeError as error:
+            _LOGGER.warning("Could not schedule TTS engine selection: %s", error)
+
+    async def _add_qwen3_reference() -> None:
+        try:
+            reference_path = await asyncio.to_thread(_choose_qwen3_reference_file)
+            if not reference_path:
+                return
+            datasource.set_qwen3_reference_audio(reference_path)
+            _LOGGER.info("Updated Qwen3-TTS voice reference: %s", reference_path)
+        except Exception as error:
+            _LOGGER.error("Could not update Qwen3-TTS voice reference: %s", error)
+
+    def _schedule_add_qwen3_reference() -> None:
+        try:
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(_add_qwen3_reference())
+            )
+        except RuntimeError as error:
+            _LOGGER.warning("Could not open Qwen3-TTS reference picker: %s", error)
+
     tray = SystemTrayController(
         _schedule_toggle_session,
         _request_shutdown,
@@ -235,6 +284,10 @@ async def _run_application() -> None:
         datasource.get_llm_providers(),
         datasource.get_selected_llm_provider(),
         _schedule_llm_provider_selection,
+        datasource.get_tts_engines(),
+        datasource.get_selected_tts_engine(),
+        _schedule_tts_engine_selection,
+        _schedule_add_qwen3_reference,
     )
     hotkey = HotkeyListener(_schedule_toggle_session)
     tray.set_agent_state(repository.get_state().value)

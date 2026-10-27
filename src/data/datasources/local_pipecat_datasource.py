@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import hashlib
 import json
 import logging
 import math
@@ -39,8 +40,11 @@ from pipecat.frames.frames import (
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.settings import TTSSettings
+from pipecat.services.tts_service import TTSService
 from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy, VADUserTurnStartStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.utils.tracing.service_decorators import traced_tts
 
 if TYPE_CHECKING:
     from pipecat.pipeline.worker import PipelineWorker
@@ -61,6 +65,11 @@ _LLM_PROVIDER_URLS = {
     "openrouter": "https://openrouter.ai/api/v1",
     "openai": "https://api.openai.com/v1",
 }
+_TTS_ENGINES = {
+    "qwen3": "Qwen3-TTS local",
+    "piper": "Piper",
+}
+_QWEN3_SPEED = {"slow": 0.88, "normal": 1.0, "fast": 1.12}
 _SESSION_DRAIN_TIMEOUT_SECS = 60.0
 _CONFIG_FILE = Path(__file__).resolve().parents[3] / "config.toml"
 _USER_SETTINGS_FILE = Path(
@@ -165,6 +174,45 @@ def _load_llm_profiles() -> tuple[str, dict[str, dict[str, Any]]]:
     return selected, profiles
 
 
+def _load_tts_config() -> dict[str, Any]:
+    with _CONFIG_FILE.open("rb") as config_file:
+        config = tomllib.load(config_file)
+    tts_config = config.get("tts", {})
+    if not isinstance(tts_config, dict):
+        raise ValueError("[tts] must be a TOML table in config.toml.")
+    engine = tts_config.get("engine", "piper")
+    if not isinstance(engine, str) or engine not in _TTS_ENGINES:
+        raise ValueError("[tts].engine must be 'qwen3' or 'piper'.")
+    return {
+        "engine": engine,
+        "qwen3": _load_qwen3_tts_config(tts_config),
+    }
+
+
+def _load_qwen3_tts_config(tts_config: dict[str, Any]) -> dict[str, str]:
+    qwen3 = tts_config.get("qwen3", {})
+    if not isinstance(qwen3, dict):
+        raise ValueError("[tts.qwen3] must be a TOML table.")
+    model = qwen3.get("model", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+    device = qwen3.get("device", "cuda")
+    reference_text = qwen3.get("reference_text", "")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("[tts.qwen3].model must be a model identifier.")
+    if not isinstance(device, str) or device not in {"cuda", "cpu", "auto"}:
+        raise ValueError("[tts.qwen3].device must be 'cuda', 'cpu' or 'auto'.")
+    if not isinstance(reference_text, str):
+        raise ValueError("[tts.qwen3].reference_text must be a string.")
+    reference_audio = qwen3.get("reference_audio", "")
+    if not isinstance(reference_audio, str):
+        raise ValueError("[tts.qwen3].reference_audio must be a path string.")
+    return {
+        "model": model,
+        "device": device,
+        "reference_text": reference_text,
+        "reference_audio": reference_audio,
+    }
+
+
 def _configure_cuda_runtime(device: str) -> None:
     if device.casefold() != "cuda" or os.name != "nt":
         return
@@ -205,6 +253,20 @@ def _configure_cuda_runtime(device: str) -> None:
             "could not be loaded. Install the NVIDIA runtime dependencies from "
             "requirements-cuda.txt and restart the application."
         ) from error
+
+
+def _qwen3_voice_prompt_cache_path(
+    reference_audio: str, model: str, reference_text: str, device: str
+) -> Path:
+    fingerprint = hashlib.sha256()
+    fingerprint.update(
+        f"qwen3-voice-prompt-v1\0{model}\0{reference_text}\0{device}\0".encode()
+    )
+    with Path(reference_audio).open("rb") as reference_file:
+        for chunk in iter(lambda: reference_file.read(1024 * 1024), b""):
+            fingerprint.update(chunk)
+    cache_dir = _USER_SETTINGS_FILE.parent / "qwen3" / "voice_prompts"
+    return cache_dir / f"{fingerprint.hexdigest()}.pt"
 
 
 @dataclass(frozen=True)
@@ -521,6 +583,99 @@ class _TranscriptionLoggingProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class _Qwen3TTSService(TTSService):
+    def __init__(
+        self,
+        *,
+        model: Any,
+        voice_clone_prompt: dict[str, Any],
+        language: str,
+        speed: float,
+        volume: float,
+    ) -> None:
+        super().__init__(
+            push_start_frame=True,
+            push_stop_frames=True,
+            stop_frame_timeout_s=30.0,
+            settings=TTSSettings(model="qwen3-tts-12hz-0.6b-base", voice=None),
+            sample_rate=24_000,
+        )
+        self._model = model
+        self._voice_clone_prompt = voice_clone_prompt
+        self._language = language
+        self._speed = speed
+        self._volume = volume
+
+    @staticmethod
+    def _synthesize_pcm(
+        model: Any,
+        voice_clone_prompt: dict[str, Any],
+        text: str,
+        language: str,
+        speed: float,
+        volume: float,
+    ) -> tuple[bytes, int, float]:
+        import numpy as np
+
+        generation_started_at = time.perf_counter()
+        waveforms, sample_rate = model.generate_voice_clone(
+            text=text,
+            language=language,
+            voice_clone_prompt=voice_clone_prompt,
+        )
+        if not waveforms:
+            raise RuntimeError("Qwen3-TTS returned no audio waveform.")
+        waveform = np.asarray(waveforms[0], dtype=np.float32).squeeze()
+        if waveform.ndim != 1 or waveform.size == 0:
+            raise RuntimeError("Qwen3-TTS returned an empty or invalid waveform.")
+        generation_seconds = time.perf_counter() - generation_started_at
+        audio_seconds = waveform.size / sample_rate
+        _LOGGER.info(
+            "Qwen3-TTS generated %d characters in %.2f seconds "
+            "(%.2fx realtime).",
+            len(text),
+            generation_seconds,
+            audio_seconds / generation_seconds if generation_seconds else 0.0,
+        )
+        if speed != 1.0:
+            import librosa
+
+            waveform = librosa.effects.time_stretch(waveform, rate=speed)
+        waveform = np.clip(waveform * volume, -1.0, 1.0)
+        return (waveform * 32767.0).astype(np.int16).tobytes(), sample_rate, generation_seconds
+
+    @traced_tts
+    async def run_tts(
+        self, text: str, context_id: str
+    ) -> AsyncGenerator[Frame, None]:
+        async def audio_chunks(audio: bytes):
+            chunk_size = int(self.sample_rate * 0.08) * 2
+            for offset in range(0, len(audio), chunk_size):
+                yield audio[offset : offset + chunk_size]
+
+        try:
+            await self.start_tts_usage_metrics(text)
+            audio, sample_rate, _ = await asyncio.to_thread(
+                self._synthesize_pcm,
+                self._model,
+                self._voice_clone_prompt,
+                text,
+                self._language,
+                self._speed,
+                self._volume,
+            )
+            async for frame in self._stream_audio_frames_from_iterator(
+                audio_chunks(audio), in_sample_rate=sample_rate, context_id=context_id
+            ):
+                await self.stop_ttfb_metrics()
+                yield frame
+        except Exception as error:
+            _LOGGER.exception("Qwen3-TTS speech synthesis failed.")
+            yield ErrorFrame(error=f"Qwen3-TTS speech synthesis failed: {error}")
+        finally:
+            await self.stop_ttfb_metrics()
+
+
 class _DiagnosticSileroVADAnalyzer(SileroVADAnalyzer):
     def __init__(self, *, sample_rate: int, params: VADParams) -> None:
         super().__init__(sample_rate=sample_rate, params=params)
@@ -528,7 +683,10 @@ class _DiagnosticSileroVADAnalyzer(SileroVADAnalyzer):
         self._last_diagnostic_at = time.monotonic()
 
     def voice_confidence(self, buffer: bytes) -> float:
-        self._last_confidence = super().voice_confidence(buffer)
+        confidence = super().voice_confidence(buffer)
+        if hasattr(confidence, "item"):
+            confidence = confidence.item()
+        self._last_confidence = float(confidence)
         return self._last_confidence
 
     def _get_smoothed_volume(self, audio: bytes) -> float:
@@ -562,6 +720,20 @@ class LocalPipecatDataSource:
                 "api_key": self._settings.llm_api_key,
             }
         self._selected_llm_provider = self._settings.llm_provider
+        tts_config = _load_tts_config()
+        self._tts_engine = tts_config["engine"]
+        qwen3_config = tts_config["qwen3"]
+        reference_audio = qwen3_config["reference_audio"]
+        self._qwen3_reference_audio = (
+            str((_CONFIG_FILE.parent / reference_audio).resolve())
+            if reference_audio and not Path(reference_audio).is_absolute()
+            else reference_audio or None
+        )
+        self._qwen3_model_id = tts_config["qwen3"]["model"]
+        self._qwen3_device = tts_config["qwen3"]["device"]
+        self._qwen3_reference_text = qwen3_config["reference_text"]
+        self._qwen3_model: Any | None = None
+        self._qwen3_loaded_device: str | None = None
         self._audio_devices = self._discover_audio_input_devices()
         self._audio_input_device = self._resolve_initial_audio_input_device()
         conversation_settings = self._load_conversation_settings()
@@ -923,6 +1095,72 @@ class LocalPipecatDataSource:
     def get_conversation_languages(self) -> list[tuple[str, str]]:
         return [(code, details[0]) for code, details in _CONVERSATION_LANGUAGES.items()]
 
+    def get_tts_engines(self) -> list[tuple[str, str]]:
+        return list(_TTS_ENGINES.items())
+
+    def get_selected_tts_engine(self) -> str:
+        return self._tts_engine
+
+    def get_qwen3_reference_audio(self) -> str | None:
+        return self._qwen3_reference_audio
+
+    def set_qwen3_reference_audio(self, reference_path: str) -> None:
+        path = Path(reference_path).expanduser().resolve()
+        if not path.is_file() or path.suffix.casefold() != ".wav":
+            raise ValueError("Escolha um arquivo WAV existente para a voz de referência.")
+        try:
+            config_path = str(path.relative_to(_CONFIG_FILE.parent))
+        except ValueError:
+            config_path = str(path)
+        self._save_toml_setting("tts.qwen3", "reference_audio", config_path)
+        self._qwen3_reference_audio = str(path)
+
+    def select_tts_engine(self, engine: str) -> None:
+        if engine not in _TTS_ENGINES:
+            raise ValueError(f"Unsupported TTS engine: {engine}")
+        self._save_toml_setting("tts", "engine", engine)
+        self._tts_engine = engine
+
+    @staticmethod
+    def _save_toml_setting(section: str, key: str, value: str) -> None:
+        lines = _CONFIG_FILE.read_text(encoding="utf-8").splitlines()
+        section_header = f"[{section}]"
+        section_start = next(
+            (index for index, line in enumerate(lines) if line.strip() == section_header),
+            None,
+        )
+        if section_start is None:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(section_header)
+            section_start = len(lines) - 1
+            section_end = len(lines)
+        else:
+            section_end = next(
+                (
+                    index
+                    for index in range(section_start + 1, len(lines))
+                    if lines[index].lstrip().startswith("[")
+                ),
+                len(lines),
+            )
+        setting_line = f"{key} = {json.dumps(value, ensure_ascii=False)}"
+        setting_index = next(
+            (
+                index
+                for index in range(section_start + 1, section_end)
+                if lines[index].partition("=")[0].strip() == key
+            ),
+            None,
+        )
+        if setting_index is None:
+            lines.insert(section_end, setting_line)
+        else:
+            lines[setting_index] = setting_line
+        temporary_file = _CONFIG_FILE.with_suffix(".toml.tmp")
+        temporary_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        temporary_file.replace(_CONFIG_FILE)
+
     def get_llm_providers(self) -> list[tuple[str, str]]:
         return [
             (
@@ -1185,15 +1423,138 @@ class LocalPipecatDataSource:
                 sample_rate=self._settings.audio_sample_rate,
                 num_channels=self._settings.audio_channels,
             )
-            tts = _ConfigurablePiperTTSService(
-                settings=PiperTTSService.Settings(voice=self.get_selected_voice()),
-                synthesis_config=SynthesisConfig(
-                    length_scale=_VOICE_SPEEDS[self._voice_speed][1],
-                    noise_scale=_VOICE_STYLES[self._voice_style][1],
-                    noise_w_scale=_VOICE_STYLES[self._voice_style][2],
+            if self._tts_engine == "piper":
+                tts = _ConfigurablePiperTTSService(
+                    settings=PiperTTSService.Settings(voice=self.get_selected_voice()),
+                    synthesis_config=SynthesisConfig(
+                        length_scale=_VOICE_SPEEDS[self._voice_speed][1],
+                        noise_scale=_VOICE_STYLES[self._voice_style][1],
+                        noise_w_scale=_VOICE_STYLES[self._voice_style][2],
+                        volume=_VOICE_VOLUMES[self._voice_volume][1],
+                    ),
+                )
+            elif self._tts_engine == "qwen3":
+                if not self._qwen3_reference_audio or not Path(
+                    self._qwen3_reference_audio
+                ).is_file():
+                    raise FileNotFoundError(
+                        "Qwen3-TTS requires a configured WAV voice reference. "
+                        "Add one from the tray menu under Voice reference."
+                    )
+                import torch
+                from qwen_tts import Qwen3TTSModel
+
+                device = self._qwen3_device
+                if device == "auto":
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                elif device == "cuda" and not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "Qwen3-TTS is configured for CUDA, but PyTorch cannot "
+                        "access the NVIDIA GPU. Install the CUDA-enabled Qwen3 "
+                        "environment or set [tts.qwen3].device = 'cpu'."
+                    )
+                if self._qwen3_model is None or self._qwen3_loaded_device != device:
+                    if device == "cuda":
+                        dtype = (
+                            torch.bfloat16
+                            if torch.cuda.is_bf16_supported()
+                            else torch.float16
+                        )
+                    else:
+                        dtype = torch.float32
+                    _LOGGER.info(
+                        "Loading Qwen3-TTS model %s on %s with %s.",
+                        self._qwen3_model_id,
+                        device,
+                        dtype,
+                    )
+                    self._qwen3_model = await asyncio.to_thread(
+                        Qwen3TTSModel.from_pretrained,
+                        self._qwen3_model_id,
+                        device_map="cuda:0" if device == "cuda" else "cpu",
+                        dtype=dtype,
+                        attn_implementation="sdpa",
+                    )
+                    self._qwen3_loaded_device = device
+
+                prompt_cache_path = await asyncio.to_thread(
+                    _qwen3_voice_prompt_cache_path,
+                    self._qwen3_reference_audio,
+                    self._qwen3_model_id,
+                    self._qwen3_reference_text,
+                    device,
+                )
+                voice_clone_prompt = None
+                if prompt_cache_path.is_file():
+                    try:
+                        voice_clone_prompt = await asyncio.to_thread(
+                            torch.load,
+                            prompt_cache_path,
+                            map_location=device,
+                            weights_only=True,
+                        )
+                        _LOGGER.info(
+                            "Reused cached Qwen3-TTS voice reference prompt."
+                        )
+                    except Exception as error:
+                        _LOGGER.warning(
+                            "Could not load cached Qwen3-TTS voice prompt; "
+                            "reprocessing the WAV: %s",
+                            error,
+                        )
+                if voice_clone_prompt is None:
+                    x_vector_only = not bool(self._qwen3_reference_text.strip())
+                    prompt_items = await asyncio.to_thread(
+                        self._qwen3_model.create_voice_clone_prompt,
+                        ref_audio=self._qwen3_reference_audio,
+                        ref_text=self._qwen3_reference_text or None,
+                        x_vector_only_mode=x_vector_only,
+                    )
+                    if not prompt_items:
+                        raise RuntimeError(
+                            "Qwen3-TTS could not prepare the selected voice reference."
+                        )
+                    prompt_item = prompt_items[0]
+                    voice_clone_prompt = {
+                        "ref_code": [prompt_item.ref_code],
+                        "ref_spk_embedding": [prompt_item.ref_spk_embedding],
+                        "x_vector_only_mode": [prompt_item.x_vector_only_mode],
+                        "icl_mode": [prompt_item.icl_mode],
+                    }
+                    try:
+                        prompt_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        temporary_cache_path = prompt_cache_path.with_name(
+                            f"{prompt_cache_path.stem}.{os.getpid()}.tmp"
+                        )
+                        await asyncio.to_thread(
+                            torch.save, voice_clone_prompt, temporary_cache_path
+                        )
+                        temporary_cache_path.replace(prompt_cache_path)
+                        if x_vector_only:
+                            _LOGGER.warning(
+                                "Qwen3-TTS is using speaker-only cloning because "
+                                "[tts.qwen3].reference_text is empty. Add the WAV "
+                                "transcript there for higher voice similarity."
+                            )
+                        else:
+                            _LOGGER.info("Cached processed Qwen3-TTS voice prompt.")
+                    except Exception as error:
+                        _LOGGER.warning(
+                            "Could not cache Qwen3-TTS voice prompt: %s", error
+                        )
+                qwen_languages = {
+                    "pt": "Portuguese",
+                    "en": "English",
+                    "es": "Spanish",
+                }
+                tts = _Qwen3TTSService(
+                    model=self._qwen3_model,
+                    voice_clone_prompt=voice_clone_prompt,
+                    language=qwen_languages[self._conversation_language],
+                    speed=_QWEN3_SPEED[self._voice_speed],
                     volume=_VOICE_VOLUMES[self._voice_volume][1],
-                ),
-            )
+                )
+
 
             context = LLMContext(
                 [
