@@ -623,11 +623,39 @@ class LocalPipecatDataSource:
 
             model = await self._resolve_llm_model(session_llm_settings)
             api_key = self._resolve_llm_api_key(session_llm_settings)
-            llm = OpenAILLMService(
-                settings=OpenAILLMService.Settings(model=model),
-                api_key=api_key,
-                base_url=session_llm_settings.llm_base_url,
-            )
+            if session_llm_settings.llm_provider == "lm_studio":
+                profile = self._llm_profiles.get("lm_studio", {})
+                mcp_servers = profile.get("mcp_servers", [])
+                if not isinstance(mcp_servers, list) or any(
+                    not isinstance(server, str) or not server.strip()
+                    for server in mcp_servers
+                ):
+                    raise ValueError(
+                        "[llm.providers.lm_studio].mcp_servers must be an array "
+                        "of LM Studio MCP server names."
+                    )
+                if mcp_servers:
+                    from src.data.datasources.local_lm_studio_mcp_service import (
+                        LocalLMStudioMCPService,
+                    )
+                    llm = LocalLMStudioMCPService(
+                        model=model,
+                        base_url=session_llm_settings.llm_base_url,
+                        api_key=api_key,
+                        mcp_servers=mcp_servers,
+                    )
+                else:
+                    llm = OpenAILLMService(
+                        settings=OpenAILLMService.Settings(model=model),
+                        api_key=api_key,
+                        base_url=session_llm_settings.llm_base_url,
+                    )
+            else:
+                llm = OpenAILLMService(
+                    settings=OpenAILLMService.Settings(model=model),
+                    api_key=api_key,
+                    base_url=session_llm_settings.llm_base_url,
+                )
             stt = WhisperSTTService(
                 device=self._settings.whisper_device,
                 compute_type=self._settings.whisper_compute_type,
@@ -828,9 +856,11 @@ class LocalPipecatDataSource:
         self, settings: LocalPipecatSettings | None = None
     ) -> str:
         settings = settings or self._settings
+        api_key = settings.llm_api_key
+        if api_key:
+            return api_key
         if settings.llm_provider in {"lm_studio", "ollama"}:
             return settings.llm_provider
-        api_key = settings.llm_api_key
         if not api_key:
             raise ValueError(
                 f"Configure api_key for provider '{settings.llm_provider}' "
