@@ -24,7 +24,7 @@ class AgentRepositoryImpl(IAgentRepository):
         async with self._session_lock:
             if self.get_state() is not AgentState.IDLE:
                 raise RuntimeError("The voice agent is already active.")
-            self._set_state(AgentState.PROCESSING)
+            self._set_state(AgentState.STARTING)
             try:
                 await self._datasource.start_session()
             except (Exception, asyncio.CancelledError):

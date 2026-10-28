@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from threading import RLock
+from threading import Event, RLock, Thread
 from typing import Sequence
 
 import pystray
@@ -89,6 +89,9 @@ class SystemTrayController:
         self._on_exit = on_exit
         self._lock = RLock()
         self._started = False
+        self._agent_state = "idle"
+        self._animation_stop = Event()
+        self._animation_thread: Thread | None = None
 
     def _create_menu(self) -> pystray.Menu:
         voice_menu_label = (
@@ -136,6 +139,13 @@ class SystemTrayController:
 
         try:
             self._icon.run_detached()
+            self._animation_stop.clear()
+            self._animation_thread = Thread(
+                target=self._animate_activity_icon,
+                name="tray-activity-animation",
+                daemon=True,
+            )
+            self._animation_thread.start()
         except Exception:
             with self._lock:
                 self._started = False
@@ -145,6 +155,12 @@ class SystemTrayController:
         with self._lock:
             if not self._started:
                 return
+            self._animation_stop.set()
+            animation_thread = self._animation_thread
+            self._animation_thread = None
+        if animation_thread is not None:
+            animation_thread.join(timeout=1.0)
+        with self._lock:
             try:
                 self._icon.stop()
             finally:
@@ -152,13 +168,32 @@ class SystemTrayController:
 
     def set_agent_state(self, state: str) -> None:
         state_labels = {
-            "idle": "inativo",
+            "idle": "pronto para iniciar",
+            "starting": "iniciando sessão",
             "listening": "ouvindo",
-            "processing": "carregando/processando",
+            "capturing": "capturando sua fala",
+            "processing": "processando resposta",
             "speaking": "falando",
         }
         label = state_labels.get(state, state)
-        self._icon.title = f"Assistente de voz — {label}"
+        with self._lock:
+            changed = state != self._agent_state
+            self._agent_state = state
+            self._icon.title = f"Assistente de voz — {label}"
+            if changed:
+                self._icon.icon = self._create_icon_image(state)
+
+    def _animate_activity_icon(self) -> None:
+        phase = 0
+        while not self._animation_stop.wait(0.18):
+            with self._lock:
+                state = self._agent_state
+                if not self._started:
+                    return
+                if state not in {"capturing", "speaking"}:
+                    continue
+                self._icon.icon = self._create_icon_image(state, phase)
+            phase += 1
 
     def _handle_push_to_talk(
         self, icon: pystray.Icon, item: pystray.MenuItem
@@ -436,12 +471,33 @@ class SystemTrayController:
             self.stop()
 
     @staticmethod
-    def _create_icon_image() -> Image.Image:
+    def _create_icon_image(state: str = "idle", phase: int = 0) -> Image.Image:
         image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        draw.ellipse((3, 3, 61, 61), fill="#2563EB")
-        draw.rounded_rectangle((26, 12, 38, 39), radius=6, fill="white")
-        draw.arc((18, 17, 46, 45), start=0, end=180, fill="white", width=4)
-        draw.line((32, 45, 32, 52), fill="white", width=4)
-        draw.line((24, 53, 40, 53), fill="white", width=4)
+        colors = {
+            "idle": "#10B981",
+            "starting": "#F59E0B",
+            "listening": "#2563EB",
+            "capturing": "#06B6D4",
+            "processing": "#F59E0B",
+            "speaking": "#8B5CF6",
+        }
+        draw.ellipse((3, 3, 61, 61), fill="#111827")
+        draw.ellipse((7, 7, 57, 57), fill=colors.get(state, "#2563EB"))
+
+        if state in {"capturing", "speaking"}:
+            heights = (12, 20, 28, 20, 12)
+            offsets = (0, 2, 4, 1, 3) if state == "speaking" else (3, 1, 4, 2, 0)
+            for index, base_height in enumerate(heights):
+                bar_height = max(8, base_height + (offsets[(index + phase) % 5] - 2) * 3)
+                x = 17 + index * 7
+                top = (64 - bar_height) // 2
+                draw.rounded_rectangle(
+                    (x, top, x + 4, top + bar_height), radius=2, fill="white"
+                )
+        else:
+            draw.rounded_rectangle((26, 12, 38, 39), radius=6, fill="white")
+            draw.arc((18, 17, 46, 45), start=0, end=180, fill="white", width=4)
+            draw.line((32, 45, 32, 52), fill="white", width=4)
+            draw.line((24, 53, 40, 53), fill="white", width=4)
         return image

@@ -647,8 +647,10 @@ class _AgentStateProcessor(FrameProcessor):
         if direction is FrameDirection.DOWNSTREAM:
             if isinstance(frame, VADUserStartedSpeakingFrame):
                 _LOGGER.info("VAD detected speech; waiting for the end of the utterance.")
+                self._on_state_change(AgentState.CAPTURING)
             elif isinstance(frame, VADUserStoppedSpeakingFrame):
                 _LOGGER.info("VAD detected the end of the utterance; Whisper will transcribe it.")
+                self._on_state_change(AgentState.PROCESSING)
             elif isinstance(frame, LLMFullResponseStartFrame):
                 _LOGGER.info(
                     "LLM provider '%s' started generating a response.",

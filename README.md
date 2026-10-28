@@ -131,6 +131,8 @@ alternar a captura; `Shift+Espaço` também alterna a sessão no modo contínuo.
 Marque **Pressionar para falar** no menu para que o microfone só capture áudio
 enquanto `Shift+Espaço` estiver pressionado. Nesse modo, o atalho inicia a sessão
 se ela ainda estiver parada. Escolha **Sair** para encerrar.
+O ícone da bandeja mostra quando o app está pronto, ouvindo, capturando sua fala,
+processando ou falando. As ondas se animam durante a captura e a resposta por voz.
 Para execução automática sem janela, configure o Agendador de Tarefas do Windows
 para iniciar `pythonw.exe` com o argumento `-m bin.main` e defina a pasta do
 projeto como **Iniciar em**.
