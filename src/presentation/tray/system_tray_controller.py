@@ -40,6 +40,8 @@ class SystemTrayController:
         kokoro_voice_options: dict[str, Sequence[tuple[str, str]]],
         kokoro_voice_settings: dict[str, str],
         on_select_kokoro_voice_setting: Callable[[str, str], None],
+        push_to_talk_enabled: bool,
+        on_set_push_to_talk: Callable[[bool], None],
     ) -> None:
         self._llm_providers = tuple(llm_providers)
         self._selected_llm_provider = selected_llm_provider
@@ -53,6 +55,8 @@ class SystemTrayController:
         }
         self._kokoro_voice_settings = dict(kokoro_voice_settings)
         self._on_select_kokoro_voice_setting = on_select_kokoro_voice_setting
+        self._push_to_talk_enabled = push_to_talk_enabled
+        self._on_set_push_to_talk = on_set_push_to_talk
         self._audio_input_devices = tuple(audio_input_devices)
         self._selected_audio_input_device = selected_audio_input_device
         self._on_select_audio_input_device = on_select_audio_input_device
@@ -108,6 +112,11 @@ class SystemTrayController:
                 self._create_conversation_language_menu(),
             ),
             pystray.MenuItem(
+                "Pressionar para falar",
+                self._handle_push_to_talk,
+                checked=lambda item: self._push_to_talk_enabled,
+            ),
+            pystray.MenuItem(
                 voice_menu_label,
                 self._create_voice_menu(),
             ),
@@ -150,6 +159,13 @@ class SystemTrayController:
         }
         label = state_labels.get(state, state)
         self._icon.title = f"Assistente de voz — {label}"
+
+    def _handle_push_to_talk(
+        self, icon: pystray.Icon, item: pystray.MenuItem
+    ) -> None:
+        self._push_to_talk_enabled = not self._push_to_talk_enabled
+        self._on_set_push_to_talk(self._push_to_talk_enabled)
+        icon.update_menu()
 
     def _handle_toggle(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         self._on_toggle_session()

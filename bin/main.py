@@ -315,15 +315,23 @@ async def _run_application() -> None:
         datasource.get_kokoro_voice_options(),
         datasource.get_kokoro_voice_settings(),
         _schedule_kokoro_voice_setting,
+        datasource.is_push_to_talk_enabled(),
+        lambda enabled: datasource.set_push_to_talk(enabled),
     )
-    hotkey = HotkeyListener(_schedule_toggle_session)
+    hotkey = HotkeyListener(
+        _schedule_toggle_session,
+        datasource.is_push_to_talk_enabled,
+        lambda pressed: datasource.set_push_to_talk_pressed(pressed),
+        lambda: repository.get_state() is not AgentState.IDLE,
+    )
     tray.set_agent_state(repository.get_state().value)
 
     try:
         tray.start()
         hotkey.start()
         _LOGGER.info(
-            "Voice assistant started; press Shift+Space to toggle a session."
+            "Voice assistant started; use the tray menu to toggle the session. "
+            "Shift+Space toggles it in continuous mode and holds-to-talk when enabled."
         )
         await shutdown_requested.wait()
     finally:

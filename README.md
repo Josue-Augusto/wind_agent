@@ -126,8 +126,11 @@ Sem janela de console:
 .\.venv\Scripts\pythonw.exe -m bin.main
 ```
 
-O ícone aparece na bandeja do sistema. Use `Shift+Espaço` ou **Iniciar/parar
-sessão** para alternar a captura; escolha **Sair** no menu para encerrar.
+O ícone aparece na bandeja do sistema. Use **Iniciar/parar sessão** para
+alternar a captura; `Shift+Espaço` também alterna a sessão no modo contínuo.
+Marque **Pressionar para falar** no menu para que o microfone só capture áudio
+enquanto `Shift+Espaço` estiver pressionado. Nesse modo, o atalho inicia a sessão
+se ela ainda estiver parada. Escolha **Sair** para encerrar.
 Para execução automática sem janela, configure o Agendador de Tarefas do Windows
 para iniciar `pythonw.exe` com o argumento `-m bin.main` e defina a pasta do
 projeto como **Iniciar em**.

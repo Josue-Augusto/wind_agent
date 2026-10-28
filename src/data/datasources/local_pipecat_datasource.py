@@ -418,6 +418,8 @@ class _SoundDeviceInputProcessor(FrameProcessor):
         self._device = device
         self._capture_channels = capture_channels
         self._gain = gain
+        self._push_to_talk_enabled = False
+        self._push_to_talk_pressed = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream: sd.InputStream | None = None
         self._active = False
@@ -458,6 +460,13 @@ class _SoundDeviceInputProcessor(FrameProcessor):
             "Microphone capture started on input device '%s'.", selected_device["name"]
         )
 
+    def set_push_to_talk(self, *, enabled: bool, pressed: bool = False) -> None:
+        self._push_to_talk_enabled = enabled
+        self._push_to_talk_pressed = pressed
+
+    def set_push_to_talk_pressed(self, pressed: bool) -> None:
+        self._push_to_talk_pressed = pressed
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         await self.push_frame(frame, direction)
@@ -480,6 +489,8 @@ class _SoundDeviceInputProcessor(FrameProcessor):
             self._first_audio_frame_logged = True
             _LOGGER.info("Microphone audio frames are reaching the Pipecat pipeline.")
 
+        if self._push_to_talk_enabled and not self._push_to_talk_pressed:
+            audio = audio * 0
         if audio.ndim > 1:
             channel_rms = (audio.astype("float64") ** 2).mean(axis=0)
             audio = audio[:, int(channel_rms.argmax())]
@@ -824,6 +835,8 @@ class LocalPipecatDataSource:
         self._qwen3_reference_text = qwen3_config["reference_text"]
         self._qwen3_model: Any | None = None
         self._qwen3_loaded_device: str | None = None
+        self._push_to_talk_enabled = False
+        self._push_to_talk_pressed = False
         self._audio_devices = self._discover_audio_input_devices()
         self._audio_input_device = self._resolve_initial_audio_input_device()
         conversation_settings = self._load_conversation_settings()
@@ -1193,6 +1206,23 @@ class LocalPipecatDataSource:
 
     def get_selected_audio_input_device(self) -> int:
         return self._audio_input_device
+
+    def set_push_to_talk(self, enabled: bool) -> None:
+        self._push_to_talk_enabled = enabled
+        if not enabled:
+            self._push_to_talk_pressed = False
+        if self._input_processor is not None:
+            self._input_processor.set_push_to_talk(
+                enabled=enabled, pressed=self._push_to_talk_pressed
+            )
+
+    def is_push_to_talk_enabled(self) -> bool:
+        return self._push_to_talk_enabled
+
+    def set_push_to_talk_pressed(self, pressed: bool) -> None:
+        self._push_to_talk_pressed = pressed
+        if self._input_processor is not None:
+            self._input_processor.set_push_to_talk_pressed(pressed)
 
     def get_audio_input_capture_channels(self) -> int:
         device = next(
@@ -1836,7 +1866,7 @@ class LocalPipecatDataSource:
                         start=[
                             VADUserTurnStartStrategy(enable_interruptions=True),
                             TranscriptionUserTurnStartStrategy(
-                                enable_interruptions=True
+                                enable_interruptions=False
                             ),
                         ]
                     ),
@@ -1853,10 +1883,19 @@ class LocalPipecatDataSource:
             vad_processor = VADProcessor(
                 vad_analyzer=_DiagnosticSileroVADAnalyzer(
                     sample_rate=self._settings.audio_sample_rate,
-                    params=VADParams(min_volume=0.2, stop_secs=0.8),
+                    params=VADParams(
+                        confidence=0.75,
+                        start_secs=0.25,
+                        min_volume=0.25,
+                        stop_secs=0.8,
+                    ),
                 )
             )
             output_processor = _SoundDeviceOutputProcessor()
+            input_processor.set_push_to_talk(
+                enabled=self._push_to_talk_enabled,
+                pressed=self._push_to_talk_pressed,
+            )
             transcription_processor = _TranscriptionLoggingProcessor(self._notify_state)
             state_processor = _AgentStateProcessor(
                 self._notify_state, session_llm_settings.llm_provider
@@ -1913,6 +1952,7 @@ class LocalPipecatDataSource:
             if self._runner_task.done():
                 await self._runner_task
                 raise RuntimeError("Pipecat worker stopped while starting the session.")
+            _LOGGER.info("Voice session is listening continuously.")
             self._notify_state(AgentState.LISTENING)
 
     async def stop_session(self) -> None:

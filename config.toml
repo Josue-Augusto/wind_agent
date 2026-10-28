@@ -32,14 +32,14 @@ reference_text = ""
 language = "en"
 piper_voices = { pt = "pt_BR-edresson-low", en = "en_US-amy-medium", es = "es_ES-davefx-medium" }
 voice = { speed = "normal", style = "steady", volume = "medium" }
-kokoro_voice = { speed = 1.0, sentence_pause = 0.25, clause_pause = 0.1, trim = true }
+kokoro_voice = { speed = 0.9, sentence_pause = 0.25, clause_pause = 0.1, trim = true }
 
-kokoro_voices = { pt = "pf_dora", en = "af_bella", es = "ef_dora" }
+kokoro_voices = { pt = "pm_santa", en = "af_bella", es = "ef_dora" }
 [conversation.prompts]
 # Edite o texto do idioma usado e reinicie o aplicativo para aplicar.
-pt = """Você é um assistente de voz. Responda sempre em português brasileiro, de forma clara e concisa como em uma conversa entre duas pessoas.
+pt = """Você é um assistente de voz, seu nome é Emy. Responda sempre em português brasileiro, de forma clara e concisa como em uma conversa entre duas pessoas.
 EVITE textos longos, responda como um humano"""
-en = """You are a voice assistant. Always respond in English, clearly and concisely. As in a conversation between two people.
+en = """You are a voice assistant, your name is Emy. Always respond in English, clearly and concisely. As in a conversation between two people.
 AVOID long texts, respond like a human"""
-es = """Eres un asistente de voz. Responde siempre en español, de forma clara y concisa. Como en una conversación entre dos personas.
+es = """Eres un asistente de voz, su nombre es Emy. Responde siempre en español, de forma clara y concisa. Como en una conversación entre dos personas.
 EVITE textos largos, responde como um humano"""
