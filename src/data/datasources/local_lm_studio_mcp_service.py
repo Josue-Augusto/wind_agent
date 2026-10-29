@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any
@@ -62,9 +63,6 @@ class LocalLMStudioMCPService(LLMService):
         await self.push_frame(LLMFullResponseStartFrame())
         await self.start_processing_metrics()
         try:
-            await self.push_frame(
-                LLMTextFrame(text=self._search_acknowledgement())
-            )
             text = await self._complete(frame.context)
             if text:
                 spoken_text = self._to_spoken_text(text)
@@ -129,23 +127,65 @@ class LocalLMStudioMCPService(LLMService):
             payload["previous_response_id"] = self._previous_response_id
 
         await self.start_ttfb_metrics()
+        payload["stream"] = True
+        result: dict[str, Any] | None = None
+        announced_tool_call = False
         async with httpx.AsyncClient(timeout=180.0) as client:
-            response = await client.post(
+            async with client.stream(
+                "POST",
                 self._endpoint,
                 json=payload,
                 headers={
                     "Authorization": f"Bearer {self._api_key}",
                     "Content-Type": "application/json",
                 },
-            )
-            if response.is_error:
-                detail = response.text.strip().replace("\n", " ")[:500]
-                raise RuntimeError(
-                    f"LM Studio returned HTTP {response.status_code}"
-                    + (f": {detail}" if detail else ".")
-                )
+            ) as response:
+                if response.is_error:
+                    detail = (await response.aread()).decode(
+                        response.encoding or "utf-8", errors="replace"
+                    ).strip().replace("\n", " ")[:500]
+                    raise RuntimeError(
+                        f"LM Studio returned HTTP {response.status_code}"
+                        + (f": {detail}" if detail else ".")
+                    )
+
+                data_lines: list[str] = []
+                async for line in response.aiter_lines():
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].strip())
+                    elif not line and data_lines:
+                        event_data = "\n".join(data_lines)
+                        data_lines.clear()
+                        if event_data:
+                            event = self._parse_stream_event(event_data)
+                            if (
+                                event.get("type") == "tool_call.start"
+                                and not announced_tool_call
+                            ):
+                                announced_tool_call = True
+                                await self.push_frame(
+                                    LLMTextFrame(text=self._search_acknowledgement())
+                                )
+                            elif event.get("type") == "chat.end":
+                                candidate = event.get("result")
+                                if isinstance(candidate, dict):
+                                    result = candidate
+                if data_lines:
+                    event = self._parse_stream_event("\n".join(data_lines))
+                    if (
+                        event.get("type") == "tool_call.start"
+                        and not announced_tool_call
+                    ):
+                        await self.push_frame(
+                            LLMTextFrame(text=self._search_acknowledgement())
+                        )
+                    elif event.get("type") == "chat.end":
+                        candidate = event.get("result")
+                        if isinstance(candidate, dict):
+                            result = candidate
         await self.stop_ttfb_metrics()
-        result = response.json()
+        if result is None:
+            raise RuntimeError("LM Studio stream ended without a chat.end result.")
         if not isinstance(result, dict):
             raise RuntimeError("LM Studio returned an invalid chat response.")
         response_id = result.get("response_id")
@@ -163,6 +203,16 @@ class LocalLMStudioMCPService(LLMService):
             and (text := self._message_text(item.get("content")))
         ]
         return "\n".join(messages_text).strip()
+
+    @staticmethod
+    def _parse_stream_event(data: str) -> dict[str, Any]:
+        try:
+            event = json.loads(data)
+        except ValueError as error:
+            raise RuntimeError("LM Studio returned an invalid stream event.") from error
+        if not isinstance(event, dict):
+            raise RuntimeError("LM Studio returned an invalid stream event.")
+        return event
 
     @staticmethod
     def _message_text(content: Any) -> str:
