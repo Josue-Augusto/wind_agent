@@ -215,10 +215,31 @@ class _SoundDeviceOutputProcessor(FrameProcessor):
         if direction is FrameDirection.DOWNSTREAM and isinstance(
             frame, TTSAudioRawFrame
         ):
-            await asyncio.to_thread(self._write_audio, frame)
+            chunk_size = max(1, frame.sample_rate // 50) * frame.num_channels * 2
+            for offset in range(0, len(frame.audio), chunk_size):
+                write_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._write_audio_chunk,
+                        frame,
+                        offset,
+                        offset + chunk_size,
+                    )
+                )
+                try:
+                    await asyncio.shield(write_task)
+                except asyncio.CancelledError:
+                    # Cancelling to_thread() does not stop its worker thread.
+                    # Finish this short write before the interruption closes
+                    # the PortAudio stream it is using.
+                    await asyncio.shield(write_task)
+                    raise
+                if not write_task.result():
+                    break
         await self.push_frame(frame, direction)
 
-    def _write_audio(self, frame: TTSAudioRawFrame) -> None:
+    def _write_audio_chunk(
+        self, frame: TTSAudioRawFrame, start: int, end: int
+    ) -> bool:
         audio_format = (frame.sample_rate, frame.num_channels)
         if self._stream is None or self._stream_format != audio_format:
             self._close_stream()
@@ -231,12 +252,17 @@ class _SoundDeviceOutputProcessor(FrameProcessor):
             self._stream_format = audio_format
 
         try:
-            self._stream.write(frame.audio)
+            self._stream.write(frame.audio[start:end])
         except sd.PortAudioError:
-            # A VAD interruption can abort the device while a blocking write is
-            # in flight. Treat that expected race as a discarded audio chunk.
-            _LOGGER.debug("Audio write ended during an interruption.", exc_info=True)
-            self._close_stream()
+            _LOGGER.warning(
+                "Audio output failed; closing the output stream.", exc_info=True
+            )
+            try:
+                self._close_stream()
+            except sd.PortAudioError:
+                _LOGGER.debug("Could not close the failed audio stream.", exc_info=True)
+            return False
+        return True
 
     def _abort_audio(self) -> None:
         """Discard queued playback immediately when the user starts speaking."""
