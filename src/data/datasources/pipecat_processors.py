@@ -230,7 +230,13 @@ class _SoundDeviceOutputProcessor(FrameProcessor):
             self._stream.start()
             self._stream_format = audio_format
 
-        self._stream.write(frame.audio)
+        try:
+            self._stream.write(frame.audio)
+        except sd.PortAudioError:
+            # A VAD interruption can abort the device while a blocking write is
+            # in flight. Treat that expected race as a discarded audio chunk.
+            _LOGGER.debug("Audio write ended during an interruption.", exc_info=True)
+            self._close_stream()
 
     def _abort_audio(self) -> None:
         """Discard queued playback immediately when the user starts speaking."""

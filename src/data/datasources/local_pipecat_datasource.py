@@ -643,6 +643,7 @@ class LocalPipecatDataSource:
                         base_url=session_llm_settings.llm_base_url,
                         api_key=api_key,
                         mcp_servers=mcp_servers,
+                        language=self._conversation_language,
                     )
                 else:
                     llm = OpenAILLMService(

@@ -5,7 +5,7 @@ selected_provider = "lm_studio"
 base_url = "http://localhost:1234/v1"
 model = "openai/gpt-oss-20b"
 api_key = "sk-lm-Gf400CKS:5Z5INAOX5IjbesWBL3iw"
-mcp_servers = ["deepseek-web"]
+mcp_servers = ["deepseek-ai-mcp"]
 
 [llm.providers.ollama]
 base_url = "http://localhost:11434/v1"
@@ -31,7 +31,7 @@ device = "cuda"
 reference_audio = "voice\\Emy-voice-pt-br.wav"
 reference_text = ""
 [conversation]
-language = "en"
+language = "pt"
 piper_voices = { pt = "pt_BR-edresson-low", en = "en_US-amy-medium", es = "es_ES-davefx-medium" }
 voice = { speed = "normal", style = "steady", volume = "medium" }
 kokoro_voice = { speed = 0.9, sentence_pause = 0.25, clause_pause = 0.1, trim = true }

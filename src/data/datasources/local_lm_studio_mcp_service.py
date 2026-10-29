@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -33,11 +34,13 @@ class LocalLMStudioMCPService(LLMService):
         base_url: str,
         api_key: str,
         mcp_servers: list[str],
+        language: str = "pt",
     ) -> None:
         super().__init__(settings=self.Settings(model=model))
         self._endpoint = self._chat_endpoint(base_url)
         self._api_key = api_key
         self._integrations = [f"mcp/{server.strip()}" for server in mcp_servers]
+        self._language = language
         self._previous_response_id: str | None = None
 
     @staticmethod
@@ -59,9 +62,14 @@ class LocalLMStudioMCPService(LLMService):
         await self.push_frame(LLMFullResponseStartFrame())
         await self.start_processing_metrics()
         try:
+            await self.push_frame(
+                LLMTextFrame(text=self._search_acknowledgement())
+            )
             text = await self._complete(frame.context)
             if text:
-                await self.push_frame(LLMTextFrame(text=text))
+                spoken_text = self._to_spoken_text(text)
+                if spoken_text:
+                    await self.push_frame(LLMTextFrame(text=spoken_text))
         except Exception as error:
             _LOGGER.exception("LM Studio MCP request failed.")
             await self.push_error(
@@ -72,6 +80,24 @@ class LocalLMStudioMCPService(LLMService):
             await self.stop_ttfb_metrics()
             await self.stop_processing_metrics()
             await self.push_frame(LLMFullResponseEndFrame())
+
+    def _search_acknowledgement(self) -> str:
+        return {
+            "en": "Let me look that up for you.",
+            "es": "Déjame buscarlo.",
+        }.get(self._language, "Deixa eu pesquisar isso para você.")
+
+    @staticmethod
+    def _to_spoken_text(text: str) -> str:
+        """Remove Markdown syntax that speech engines may fail to pronounce."""
+        text = re.sub(r"```[^\n]*\n?(.*?)```", r"\1", text, flags=re.DOTALL)
+        text = re.sub(r"`([^`]+)`", r"\1", text)
+        text = re.sub(r"!?\[([^\]]+)\]\([^)]*\)", r"\1", text)
+        text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+        text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+        text = re.sub(r"^\s*\d+[.)]\s+", "", text, flags=re.MULTILINE)
+        text = re.sub(r"[*_~]{1,3}", "", text)
+        return re.sub(r"\n{3,}", "\n\n", text).strip()
 
     async def _complete(self, context: LLMContext) -> str:
         messages = self.get_llm_adapter().get_messages(context)
