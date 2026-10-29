@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -80,10 +81,40 @@ class LocalLMStudioMCPService(LLMService):
             await self.push_frame(LLMFullResponseEndFrame())
 
     def _search_acknowledgement(self) -> str:
-        return {
-            "en": "Let me look that up for you.",
-            "es": "Déjame buscarlo.",
-        }.get(self._language, "Deixa eu pesquisar isso para você.")
+        phrases = {
+            "en": (
+                "Sure, let me check that for you. One moment.",
+                "I’ll look into that now. Just a moment.",
+                "Let me find out for you. Give me a second.",
+            ),
+            "es": (
+                "Claro, déjame comprobarlo. Un momento.",
+                "Voy a buscarlo ahora. Dame un instante.",
+                "Déjame revisar eso por ti. Un segundo.",
+            ),
+        }.get(
+            self._language,
+            (
+                "Certo, deixa eu conferir isso aqui. Um momento.",
+                "Vou pesquisar isso para você. Só um instante.",
+                "Deixa eu verificar essa informação. Já te respondo.",
+                "Beleza, vou dar uma olhada nisso. Um segundinho.",
+            ),
+        )
+        return random.choice(phrases)
+
+    @staticmethod
+    def _request_explicitly_asks_for_search(text: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(busca(?:r)?|pesquisa(?:r)?|procura(?:r)?|consulta(?:r)?|"
+                r"investiga(?:r)?|na internet|na web|online|"
+                r"search|look up|find out|research|check online|"
+                r"busca|busca en internet|investiga|consulta)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
 
     @staticmethod
     def _to_spoken_text(text: str) -> str:
@@ -115,6 +146,10 @@ class LocalLMStudioMCPService(LLMService):
             _LOGGER.warning("Skipping unsupported non-text LM Studio user input.")
             return ""
 
+        announced_tool_call = self._request_explicitly_asks_for_search(user_input)
+        if announced_tool_call:
+            await self.push_frame(LLMTextFrame(text=self._search_acknowledgement()))
+
         payload: dict[str, Any] = {
             "model": self._settings.model,
             "input": user_input,
@@ -129,7 +164,6 @@ class LocalLMStudioMCPService(LLMService):
         await self.start_ttfb_metrics()
         payload["stream"] = True
         result: dict[str, Any] | None = None
-        announced_tool_call = False
         async with httpx.AsyncClient(timeout=180.0) as client:
             async with client.stream(
                 "POST",
